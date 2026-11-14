@@ -1,0 +1,6 @@
+# Image builder hosts and cloud IDs; only config.env.example is tracked.
+scripts/image_build/config.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

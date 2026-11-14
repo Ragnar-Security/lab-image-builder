@@ -1,0 +1,20 @@
+[project]
+name = "lab-image-builder"
+version = "0.0.0"
+description = "Build VM images for lab environments from a recipe on Proxmox, AWS or GCP."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+# The builder is bash; Python is only for the tests.
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest==9.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/ is a package (tests/__init__.py), so pytest's default "prepend"
+# import mode puts the repo root on sys.path and `from tests.test_image_build
+# import ...` resolves, as it did in Ragnar-Lab-Playground.

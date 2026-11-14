@@ -1,0 +1,3 @@
+# Store all text with LF: bash fails on a CRLF script before its first command
+# ("$'\r': command not found").
+* text=auto eol=lf

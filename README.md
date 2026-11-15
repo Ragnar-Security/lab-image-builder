@@ -1,6 +1,7 @@
 # lab-image-builder
 
-Builds VM images for lab environments from a recipe, on Proxmox, AWS or GCP.
+Builds VM images for lab environments from a recipe, on Proxmox, AWS, GCP or
+Azure (the Azure backend is tested against a fake `az` only so far).
 It is plain bash plus each platform's own CLI: no Packer, Vagrant, Ansible or
 Terraform, and no disk conversion. Each backend builds from its own base, so
 one recipe yields one native image per platform.
@@ -27,7 +28,8 @@ is built.
 ## Quick start
 
 Requirements on the machine that runs a build: bash, git, tar, OpenSSH, and
-`python3` for the Proxmox backend, the AWS CLI v2 for AWS, `gcloud` for GCP.
+`python3` for the Proxmox backend, the AWS CLI v2 for AWS, `gcloud` for GCP,
+`az` for Azure.
 
 ```bash
 cp scripts/image_build/config.env.example scripts/image_build/config.env
@@ -43,7 +45,7 @@ scripts/image_build/build_image.sh --reap aws --dry-run
 scripts/image_build/build_image.sh --reap aws
 ```
 
-The backend is `proxmox`, `aws` or `gcp`.
+The backend is `proxmox`, `aws`, `gcp` or `azure`.
 
 ## `scripts/sync_template.sh`
 

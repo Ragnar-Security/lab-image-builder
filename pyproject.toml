@@ -1,7 +1,7 @@
 [project]
 name = "lab-image-builder"
 version = "0.0.0"
-description = "Build VM images for lab environments from a recipe on Proxmox, AWS or GCP."
+description = "Build VM images for lab environments from a recipe on Proxmox, AWS, GCP or Azure."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a VM image from a recipe on one backend (proxmox, aws or gcp).
+# Build a VM image from a recipe on one backend (proxmox, aws, gcp or azure).
 #
 # Usage:
 #   build_image.sh [--dry-run] [--allow-dirty] <recipe.env> <backend>
@@ -36,7 +36,12 @@
 #               VERIFY BASE_PROXMOX BASE_AWS BASE_GCP DISK_GB AWS_INSTANCE_TYPE
 #               GCP_MACHINE_TYPE PVE_MEMORY_MB PVE_CORES. Optional: SETUP_PASSES
 #               (1), KEEP_SSH (no), GCP_IMAGE_FAMILY (IMAGE_PREFIX),
-#               PAYLOAD_EXCLUDE (space-separated tar --exclude globs).
+#               AZURE_VM_SIZE (required by the azure backend, through its
+#               BACKEND_RECIPE_KEYS), AWS_DISK_GB GCP_DISK_GB AZURE_DISK_GB
+#               (each overrides DISK_GB on its own backend only; Proxmox
+#               always uses DISK_GB), PAYLOAD_EXCLUDE (space-separated tar
+#               --exclude globs). BASE_<BACKEND> is required for the backend
+#               named (BASE_AZURE only when building on azure).
 #               PAYLOAD_DIR is relative to the recipe; SETUP and VERIFY are
 #               relative to PAYLOAD_DIR.
 #   IMAGE_BUILD_TTL_MINUTES   expiry tagged on build resources (default 240).
@@ -72,9 +77,18 @@
 #   backend_destroy_id <id>     re-checks the tag (through `query`), then
 #                               destroys (through `mutate`).
 #   backend_templates_yaml <image_id>  prints the templates.yaml lines.
+# Optional:
+#   BACKEND_RECIPE_KEYS         space-separated recipe keys (from
+#                               RECIPE_OPTIONAL) this backend requires; a
+#                               build whose recipe lacks one stops with exit 2.
+#   backend_reboot              reboots the build VM when a setup pass exits
+#                               100, instead of the core's in-guest reboot
+#                               command. The core then waits for a new boot
+#                               ID over SSH either way.
 # The base pattern passed to backend_resolve_base is the recipe's
-# BASE_<BACKEND> (BASE_PROXMOX, BASE_AWS, BASE_GCP).
-# Variables a backend may read: RUN_ID (ib-<yyyymmddhhmm>-<4 hex>),
+# BASE_<BACKEND> (BASE_PROXMOX, BASE_AWS, BASE_GCP, BASE_AZURE).
+# Variables a backend may read: RUN_ID (ib-<yyyymmddhhmm>-<16 hex>; builds
+# started before 2026-11-14 used 4 hex, which every reap still accepts),
 # BUILD_EXPIRES_UTC (yyyymmddhhmm, UTC), IMAGE_NAME, IMAGE_BUILD_COMMIT,
 # IMAGE_BUILD_RECIPE (recipe path within its repo), DRY_RUN (0|1), every
 # recipe and config key.
@@ -90,7 +104,8 @@ PROG="build_image.sh"
 
 RECIPE_REQUIRED=(IMAGE_PREFIX OS_FAMILY PAYLOAD_DIR SETUP VERIFY BASE_PROXMOX BASE_AWS BASE_GCP
                  DISK_GB AWS_INSTANCE_TYPE GCP_MACHINE_TYPE PVE_MEMORY_MB PVE_CORES)
-RECIPE_OPTIONAL=(SETUP_PASSES KEEP_SSH GCP_IMAGE_FAMILY PAYLOAD_EXCLUDE)
+RECIPE_OPTIONAL=(SETUP_PASSES KEEP_SSH GCP_IMAGE_FAMILY AZURE_VM_SIZE AWS_DISK_GB GCP_DISK_GB AZURE_DISK_GB
+                 PAYLOAD_EXCLUDE)
 BACKEND_FUNCTIONS=(backend_check_config backend_resolve_base backend_start backend_save
                    backend_destroy backend_leftovers backend_destroy_id backend_templates_yaml)
 # The build log, relative to the recipe repo's root. It is excluded from the
@@ -190,7 +205,7 @@ utc_stamp() {
 }
 
 load_backend() {
-  local name="$1" dir="${IMAGE_BUILD_BACKENDS_DIR:-$SCRIPT_DIR/backends}" fn
+  local name="$1" dir="${IMAGE_BUILD_BACKENDS_DIR:-$SCRIPT_DIR/backends}" fn key
   if ! [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || [ ! -f "$dir/$name.sh" ]; then
     local available=""
     if [ -d "$dir" ]; then
@@ -198,7 +213,7 @@ load_backend() {
     fi
     config_error "unknown backend '$name' (available in $dir: ${available:-none})"
   fi
-  unset BACKEND_CONFIG_PREFIX
+  unset BACKEND_CONFIG_PREFIX BACKEND_RECIPE_KEYS
   # shellcheck source=/dev/null
   source "$dir/$name.sh"
   for fn in "${BACKEND_FUNCTIONS[@]}"; do
@@ -206,6 +221,12 @@ load_backend() {
   done
   [[ "${BACKEND_CONFIG_PREFIX:-}" =~ ^[A-Z][A-Z0-9]*_$ ]] \
     || config_error "backend '$name' does not set BACKEND_CONFIG_PREFIX (e.g. AWS_)"
+  # Only an optional recipe key can be one a backend requires: the recipe
+  # reader takes no other name.
+  for key in ${BACKEND_RECIPE_KEYS:-}; do
+    [[ " ${RECIPE_OPTIONAL[*]} " == *" $key "* ]] \
+      || config_error "backend '$name' requires $key, which is not an optional recipe key"
+  done
   BACKEND="$name"
 }
 
@@ -396,6 +417,10 @@ reboot_command() {
 
 reboot_vm() {
   local rc=0
+  if declare -F backend_reboot >/dev/null; then
+    backend_reboot
+    return 0
+  fi
   rssh "$(reboot_command)" || rc=$?
   # 255: the session was cut as the VM went down.
   case "$rc" in
@@ -595,6 +620,11 @@ case "$KEEP_SSH" in yes|no) ;; *) config_error "KEEP_SSH must be yes or no (got 
 for key in SETUP_PASSES DISK_GB PVE_MEMORY_MB PVE_CORES; do
   is_posint "${!key}" || config_error "$key must be a positive integer (got '${!key}')"
 done
+for key in AWS_DISK_GB GCP_DISK_GB AZURE_DISK_GB; do
+  if [ -n "${!key:-}" ]; then
+    is_posint "${!key}" || config_error "$key must be a positive integer (got '${!key}')"
+  fi
+done
 case "$PAYLOAD_DIR" in
   /*|'~'*) config_error "PAYLOAD_DIR must be relative to the recipe file (got '$PAYLOAD_DIR')" ;;
 esac
@@ -636,7 +666,9 @@ fi
 NOW_EPOCH="$(date -u +%s)"
 STAMP="$(utc_stamp "$NOW_EPOCH")"
 BUILD_EXPIRES_UTC="$(utc_stamp $((NOW_EPOCH + TTL_MINUTES * 60)))"
-RUN_ID="ib-$STAMP-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
+# 64 random bits, so two builds started in the same minute do not share an ID
+# by chance (16 bits did, one time in 65536 per pair).
+RUN_ID="ib-$STAMP-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 IMAGE_NAME="$IMAGE_PREFIX-$SHA7-$STAMP"
 if ! [[ "$IMAGE_NAME" =~ ^[a-z]([-a-z0-9]*[a-z0-9])?$ ]] || [ "${#IMAGE_NAME}" -gt 63 ]; then
   config_error "image name $IMAGE_NAME must be [a-z0-9-], start with a letter and be at most 63 characters (IMAGE_PREFIX at most 42)"
@@ -649,6 +681,9 @@ load_backend "$BACKEND_ARG"
 load_config
 BASE_PATTERN="${!BASE_VAR:-}"
 [ -n "$BASE_PATTERN" ] || config_error "recipe $RECIPE_ARG does not set $BASE_VAR (the base for backend $BACKEND)"
+for key in ${BACKEND_RECIPE_KEYS:-}; do
+  [ -n "${!key:-}" ] || config_error "recipe $RECIPE_ARG does not set $key (required by backend $BACKEND)"
+done
 
 # --- build -----------------------------------------------------------------------
 
@@ -685,7 +720,11 @@ for ((pass = 1; pass <= SETUP_PASSES; pass++)); do
   # proves the VM went down and came back.
   BOOT_BEFORE="$(read_boot_id)" || die "cannot read the boot ID of $SSH_TARGET"
   if [ "$DRY_RUN" = 1 ]; then
-    log "DRY RUN: if setup exits $SETUP_REBOOT_RC, the core runs on the VM: $(reboot_command)"
+    if declare -F backend_reboot >/dev/null; then
+      log "DRY RUN: if setup exits $SETUP_REBOOT_RC, the core calls backend_reboot ($BACKEND)"
+    else
+      log "DRY RUN: if setup exits $SETUP_REBOOT_RC, the core runs on the VM: $(reboot_command)"
+    fi
   fi
   rc=0
   remote_script "$SETUP" || rc=$?

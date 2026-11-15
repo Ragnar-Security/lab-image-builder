@@ -63,18 +63,22 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - The Windows seal deletes the cached DHCP lease, so Proxmox clones of a
     built Windows image request their own address.
 - An Azure backend, `backends/azure.sh` (`build_image.sh <recipe> azure`),
-  tested against a fake `az` only; no live Azure build has run yet. Each
-  build gets its own resource group, created create-only (`az rest` PUT with
-  `If-None-Match: *`) carrying only a creation token (a random 128-bit
-  nonce) that no reap matches, and owned only on `201 Created`: only then is
-  it tagged with the run ID, its expiry and the same nonce as its owner, and
-  all four are read back before the build goes on. The cleanup and the reap
-  delete only a group whose creation token and owner nonce agree, so a
-  same-name group that replaced it is never deleted. The image is a specialized version in an operator's
-  Azure Compute Gallery. Config keys `AZ_*`; recipe keys `BASE_AZURE` and
-  `AZURE_VM_SIZE`, required only for Azure builds. Reads fail closed: only an
-  exact not-found code counts as absent, and a reap refuses an expiry that
-  is not a real calendar minute.
+  run live once (2026-11-15, Linux; no Windows image produced yet). Each
+  build gets its own resource group. Azure has no create-only call for a
+  group (it ignores `If-None-Match` on the PUT), so a fail-closed read
+  refuses an existing group first; the PUT carries only a creation token (a
+  random 128-bit nonce) that no reap matches, and the group is owned only on
+  `201 Created`: only then is it tagged with the run ID, its expiry and the
+  same nonce as its owner, and all four are read back before the build goes
+  on. The cleanup and the reap delete only a group whose creation token and
+  owner nonce agree, so a same-name group that replaced it is never deleted.
+  The image is a specialized version (definition `SecurityType=Standard`)
+  in an operator's Azure Compute Gallery. On Windows the built-in
+  Administrator, which Azure renames to the admin user, is found by SID and
+  named `Administrator` again. Config keys `AZ_*`; recipe keys `BASE_AZURE`
+  and `AZURE_VM_SIZE`, required only for Azure builds. Reads fail closed:
+  only an exact not-found code counts as absent, and a reap refuses an
+  expiry that is not a real calendar minute.
 - Optional recipe keys `AWS_DISK_GB`, `GCP_DISK_GB` and `AZURE_DISK_GB`
   override `DISK_GB` on that backend only (GCP's Windows images are 50 GB and
   Azure's 127 GB, while Proxmox requires `DISK_GB` to equal its base).

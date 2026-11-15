@@ -4,13 +4,13 @@
 # (ib-<yyyymmddhhmm>-<16 hex>), in AZ_BUILD_LOCATION and tagged
 # image-build=<run ID>, image-build-expires=<yyyymmddhhmm UTC>,
 # image-build-owner=<nonce> and image-build-creating=<nonce>, where <nonce>
-# is a random 128-bit value made for this run. The group is created with a
-# create-only PUT (`az rest`, If-None-Match: *) that carries only the
-# creation token image-build-creating=<nonce>, which no reap matches; this
-# run owns it, and merges on the other three tags, only when Azure answered
-# 201 Created and the read-back shows all four (see _az_create_group).
-# Azure's own `az group create` is an upsert that would adopt, and retag, a
-# group someone else made. The build VM (same name), its NIC, OS disk and
+# is a random 128-bit value made for this run. A fail-closed read refuses a
+# group of that name that already exists; then a PUT (`az rest`; Azure
+# ignores If-None-Match on resource groups, so a PUT is not create-only)
+# carries only the creation token image-build-creating=<nonce>, which no reap
+# matches; this run owns the group, and merges on the other three tags, only
+# when Azure answered 201 Created and the read-back shows all four (see
+# _az_create_group). The build VM (same name), its NIC, OS disk and
 # public IP all live in that group, so a destroy or a reap deletes the group,
 # and only after re-reading its tags: both require image-build-creating ==
 # image-build-owner (the cleanup: == this run's nonce), so a same-name group
@@ -38,15 +38,19 @@
 #   Windows  Azure injects no SSH key into Windows. The VM's admin `builder`
 #            gets a random password made here, written to the core's per-run
 #            temp dir and passed as az's @file, so it is never on a command
-#            line, printed or kept. Then `az vm run-command invoke` runs the
-#            GCP backend's OpenSSH setup (install OpenSSH Server, write the key
-#            to administrators_authorized_keys, enable Administrator with a
-#            random password made in the guest, start sshd, open tcp/22). The
-#            build logs in as Administrator, as on AWS and GCP.
+#            line, printed or kept. Azure gives that name to the built-in
+#            Administrator (RID 500), so there is no separate `builder`
+#            account. Then `az vm run-command invoke` runs the GCP backend's
+#            OpenSSH setup (install OpenSSH Server, write the key to
+#            administrators_authorized_keys, start sshd, open tcp/22), which
+#            also renames the RID-500 account back to Administrator and gives
+#            it a random password made in the guest. The build logs in as
+#            Administrator, as on AWS and GCP.
 #   A specialized gallery base (an image this backend built with KEEP_SSH=yes)
-#   takes no admin profile: the VM is created with --specialized, and
-#   run-command writes the key (Linux: builder's authorized_keys; Windows: the
-#   same OpenSSH setup).
+#   is created with --specialized. az 2.92 still demands a credential (the
+#   run's key, or the generated password) and then leaves it out of the VM,
+#   so run-command writes the key (Linux: builder's authorized_keys; Windows:
+#   the same OpenSSH setup).
 #
 # Reboots (setup exit 100) go through `az vm restart`; the core then waits for
 # a new boot ID over SSH as on every backend.
@@ -57,11 +61,12 @@ BACKEND_CONFIG_PREFIX=AZ_
 BACKEND_RECIPE_KEYS="AZURE_VM_SIZE"
 
 _AZ_RUN_ID_RE='^ib-[0-9]{12}-[0-9a-f]{16}$'
-# The only error codes a read accepts as "does not exist" (exit 3 as well).
-# Anything else (SubscriptionNotFound, AuthorizationFailed, a tenant or parse
-# error, an unknown code) fails the read.
-_AZ_GALLERY_ABSENT="ResourceNotFound GalleryImageNotFound GalleryImageVersionNotFound"
-# The resource-group API version of the create-only PUT.
+# The only error code a gallery read accepts as "does not exist" (with exit
+# 3): az 2.92 answers a missing gallery, definition or version with exactly
+# ResourceNotFound (seen live, 2026-11-15). Anything else (SubscriptionNotFound,
+# AuthorizationFailed, a tenant or parse error, an unknown code) fails the read.
+_AZ_GALLERY_ABSENT="ResourceNotFound"
+# The resource-group API version of the group PUT.
 _AZ_RG_API=2021-04-01
 _AZ_GUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 _AZ_URN_RE='^[A-Za-z0-9._-]+:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$'
@@ -243,7 +248,7 @@ _az_base_facts() {
   if [[ "$base" =~ $_AZ_URN_RE ]]; then
     row="$(query "$ostype"$'\t'V2 az vm image show --subscription "$AZ_SUBSCRIPTION_ID" \
       --location "$AZ_BUILD_LOCATION" --urn "$base" \
-      --query '[osDiskImage.operatingSystem, hyperVGeneration]' --output tsv)"
+      --query '[[osDiskImage.operatingSystem, hyperVGeneration]]' --output tsv)"
     IFS=$'\t' read -r os gen <<< "${row//$'\r'/}"
     state=Generalized
   else
@@ -252,7 +257,7 @@ _az_base_facts() {
     row="$(query "$ostype"$'\t'Generalized$'\t'V2 az sig image-definition show \
       --subscription "${parts[0]}" --resource-group "${parts[1]}" --gallery-name "${parts[2]}" \
       --gallery-image-definition "${parts[3]}" \
-      --query '[osType, osState, hyperVGeneration]' --output tsv)"
+      --query '[[osType, osState, hyperVGeneration]]' --output tsv)"
     IFS=$'\t' read -r os state gen <<< "${row//$'\r'/}"
   fi
   # An image that names no generation is generation 1.
@@ -272,8 +277,8 @@ _az_base_facts() {
 }
 
 # The Windows run-command script: the GCP backend's startup script (OpenSSH,
-# the key, Administrator enabled with a password made in the guest, tcp/22),
-# plus the completion marker.
+# the key, tcp/22), the RID-500 account renamed back to Administrator with a
+# password made in the guest, plus the completion marker.
 _az_windows_ssh_script() {
   printf "\$buildKey = '%s'\n" "$1"
   cat <<'PS1'
@@ -294,10 +299,18 @@ Set-Content -LiteralPath $auth -Value $buildKey -Encoding ascii
 icacls.exe $auth /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "icacls failed on $auth" }
 
-# Administrator is disabled on Azure images. Enable it with a random password,
-# generated here and never output (the seal replaces it again).
-$admin = Get-LocalUser -Name 'Administrator'
-if (-not $admin.Enabled) {
+# Azure renames the built-in Administrator (RID 500) to the VM's admin user
+# (builder) at provisioning, so no account is called Administrator (seen live,
+# 2026-11-15). Name it Administrator again, as on AWS and GCP: the build logs
+# in as Administrator, and the seal and the payloads use that name. Then give
+# it a random password, generated here and never output (the seal replaces it
+# again), and enable it. A specialized base this backend built already has an
+# enabled Administrator and keeps it as it is.
+$admin = Get-LocalUser | Where-Object { $_.SID.Value.EndsWith('-500') }
+if (-not $admin) { throw 'no built-in administrator (RID 500) found' }
+$renamed = $admin.Name -ne 'Administrator'
+if ($renamed) { Rename-LocalUser -SID $admin.SID -NewName 'Administrator' }
+if ($renamed -or -not $admin.Enabled) {
     $alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+'
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     $secure = New-Object System.Security.SecureString
@@ -362,13 +375,26 @@ _az_run_ssh_setup() {
   fi
 }
 
-# Create this run's resource group, create-only, and own it (BUILD_VM_ID) only
-# when Azure answers 201 Created. `az group create` is a create-or-update: a
-# group of this name made by anyone between a check and the create would be
-# adopted and retagged, and later deleted as this run's. So the group is PUT
-# through `az rest` with If-None-Match: * (412 when it exists), with --debug
-# so the HTTP status can be read from the log (the log stays in a file, which
-# is deleted: it holds a prefix of the access token).
+# Create this run's resource group and own it (BUILD_VM_ID) only when Azure
+# answers 201 Created. There is no create-only primitive for a resource
+# group: `az group create` is a create-or-update, and Azure ignores
+# If-None-Match (and If-Match) on a resource-group PUT, so a PUT on an
+# existing group answers 200 and replaces its tags (seen live, 2026-11-15; a
+# group has no etag). So:
+#   1. A fail-closed read first: only exit 3 with exactly
+#      ResourceGroupNotFound lets the build go on; a group that exists is
+#      refused, unchanged, and any other error stops the build.
+#   2. The PUT, through `az rest` with --debug so the HTTP status can be read
+#      from the log (the log stays in a file, which is deleted: it holds a
+#      prefix of the access token). If-None-Match: * is still sent, in case
+#      Azure ever honours it (then: 412).
+# Residual race: a group created under this name between the read and the
+# PUT (a second or two). The name carries 64 random bits and is not
+# published before the PUT, so that is a 2^-64 coincidence or someone who can
+# read the build host and already holds resourceGroups/write. If it happens,
+# that group's tags are replaced by the creation token below, the PUT answers
+# 200, and the build stops: nothing is owned, deleted or reaped; its other
+# tags are lost, its resources untouched.
 #
 # The PUT is non-reapable by construction: its only tag is the creation
 # token image-build-creating=<this run's 128-bit nonce>, with no image-build,
@@ -387,11 +413,12 @@ _az_run_ssh_setup() {
 #                201 misread), so the build stops and names the group with
 #                the command to delete it by hand. An empty resource group
 #                costs nothing.
-#   412          exists already: nothing changed, nothing owned.
+#   412          exists already (only if Azure starts honouring the header):
+#                nothing changed, nothing owned.
 #   other error, 200, unknown status
 #                nothing owned, nothing deleted, no further write. A 200 means
-#                Azure ignored the condition and replaced an existing group's
-#                tags with image-build-creating; the error names the group.
+#                the race above happened: an existing group's tags were
+#                replaced with image-build-creating; the error names the group.
 #
 # The status is read only from this request's own response: the
 # `Response status:` line that follows a `Request URL:` line naming exactly
@@ -412,6 +439,12 @@ _az_create_group() {
   local rg="$1" dir="$2" url body log rc=0 status errors trc=0 rrc=0 back="" tag="" expires="" owner="" creating=""
   url="/subscriptions/$AZ_SUBSCRIPTION_ID/resourcegroups/$rg?api-version=$_AZ_RG_API"
   body="{\"location\":\"$AZ_BUILD_LOCATION\",\"tags\":{\"image-build-creating\":\"$_AZ_NONCE\"}}"
+  # Step 1 (see above): refuse a group that already exists, without writing.
+  _az_read @absent "resource group $rg" ResourceGroupNotFound \
+    az group show --subscription "$AZ_SUBSCRIPTION_ID" --name "$rg" --query id --output tsv
+  if [ "$_AZ_FOUND" = 1 ]; then
+    die "azure: resource group $rg already exists; not used, not changed"
+  fi
   if [ "$DRY_RUN" = 1 ]; then
     mutate az rest --method put --url "$url" --headers 'If-None-Match=*' --body "$body" --output none
   else
@@ -494,16 +527,25 @@ backend_start() {
         --public-ip-address "$vm-ip" --public-ip-sku Standard
         --public-ip-address-allocation static --security-type Standard
         --tags "${tags[@]}")
-  if [ "$_AZ_BASE_STATE" = Specialized ]; then
-    args+=(--specialized)
-  elif [ "$OS_FAMILY" = windows ]; then
+  # az (2.92, live 2026-11-15) validates an admin credential even with
+  # --specialized ("An RSA key file or key value must be supplied", or a
+  # password prompt on Windows), then leaves osProfile out of a specialized
+  # VM's template: the credential is required but never reaches the VM. So it
+  # is passed in both cases; for a specialized base, run-command writes the key.
+  if [ "$OS_FAMILY" = windows ]; then
     _az_admin_password_file "$dir/azure-admin-password"
-    # A Windows computer name is at most 15 characters: ib-<ddhhmm>-<last 4 hex>.
-    stamp="${run_id:3:12}"
     args+=(--admin-username builder --admin-password "@$dir/azure-admin-password"
-           --authentication-type password --computer-name "ib-${stamp:6:6}-${run_id: -4}")
+           --authentication-type password)
+    if [ "$_AZ_BASE_STATE" != Specialized ]; then
+      # A Windows computer name is at most 15 characters: ib-<ddhhmm>-<last 4 hex>.
+      stamp="${run_id:3:12}"
+      args+=(--computer-name "ib-${stamp:6:6}-${run_id: -4}")
+    fi
   else
     args+=(--admin-username builder --authentication-type ssh --ssh-key-values "$pubkey")
+  fi
+  if [ "$_AZ_BASE_STATE" = Specialized ]; then
+    args+=(--specialized)
   fi
   args+=(--output none)
   mutate az "${args[@]}" >&2
@@ -565,7 +607,7 @@ backend_save() {
 
   _az_read @absent "image definition $IMAGE_PREFIX" "$_AZ_GALLERY_ABSENT" \
     az sig image-definition show "${gallery[@]}" \
-    --query '[osType, osState, hyperVGeneration]' --output tsv
+    --query '[[osType, osState, hyperVGeneration]]' --output tsv
   if [ "$_AZ_FOUND" = 1 ]; then
     IFS=$'\t' read -r os state gen <<< "$_AZ_OUT"
     if ! [[ "$os" =~ ^(Linux|Windows)$ && "$state" =~ ^(Generalized|Specialized)$ && "$gen" =~ ^V[12]$ ]]; then
@@ -578,7 +620,7 @@ backend_save() {
     mutate az sig image-definition create "${gallery[@]}" --location "$AZ_BUILD_LOCATION" \
       --publisher image-build --offer "$IMAGE_PREFIX" --sku "$IMAGE_PREFIX" \
       --os-type "$ostype" --os-state Specialized --hyper-v-generation "$_AZ_BASE_GEN" \
-      --output none >&2
+      --features SecurityType=Standard --output none >&2
   fi
 
   # Deallocated, so the OS disk is consistent when it is captured.
@@ -600,14 +642,21 @@ backend_save() {
 }
 
 # Reads a resource group's image-build, image-build-expires,
-# image-build-owner and image-build-creating tags into _AZ_OUT
-# (tab-separated); _AZ_FOUND=0 only when az reports exactly
-# ResourceGroupNotFound.
+# image-build-owner and image-build-creating tags into _AZ_OUT as one
+# tab-separated row (the query is a list of lists: `-o tsv` prints a flat
+# list one value per line); a missing tag, which az prints as None, reads as
+# empty. _AZ_FOUND=0 only when az reports exactly ResourceGroupNotFound.
 _az_group_tags() {
   _az_read "$2" "resource group $1" ResourceGroupNotFound \
     az group show --subscription "$AZ_SUBSCRIPTION_ID" --name "$1" \
-    --query '[tags."image-build", tags."image-build-expires", tags."image-build-owner", tags."image-build-creating"]' \
+    --query '[[tags."image-build", tags."image-build-expires", tags."image-build-owner", tags."image-build-creating"]]' \
     --output tsv
+  _AZ_OUT="$(_az_none_empty <<< "$_AZ_OUT")"
+}
+
+# az -o tsv prints a missing value as None: make each such field empty.
+_az_none_empty() {
+  awk 'BEGIN { FS = OFS = "\t" } { for (i = 1; i <= NF; i++) if ($i == "None") $i = ""; print }'
 }
 
 # Is this group this run's, right now? Its tags ($1-$4: image-build,
@@ -665,8 +714,9 @@ backend_leftovers() {
   rows="$(query "" az group list --subscription "$AZ_SUBSCRIPTION_ID" --tag image-build \
     --query '[].[name, tags."image-build", tags."image-build-expires", tags."image-build-owner", tags."image-build-creating"]' \
     --output tsv)"
+  # One tab-separated row per group (a list of lists); a missing tag is None.
+  rows="$(_az_none_empty <<< "${rows//$'\r'/}")"
   while IFS=$'\t' read -r name tag expires owner creating; do
-    creating="${creating%$'\r'}"
     [ -n "$name" ] || continue
     why="$(_az_reapable "$tag" "$expires" "$owner" "$creating" "$name")"
     if [ -z "$why" ]; then

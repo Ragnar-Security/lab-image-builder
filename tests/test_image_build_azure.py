@@ -41,13 +41,21 @@ READY = "image-build-ssh-ready"
 # from the file: a run-command script is copied to $CALL_LOG.scripts and an
 # admin password to $CALL_LOG.secret (test-only: the real az keeps neither).
 # State lives in $AZ_STATE (JSON). A missing resource fails as az does: exit 3
-# and a "(...NotFound)" code. Anything unrecognised fails loudly.
+# and a "(...NotFound)" code (gallery reads: only ResourceNotFound, as az 2.92
+# answers live). Anything unrecognised fails loudly.
+#
+# `-o tsv` output has az 2.92's shapes (seen live, 2026-11-15): a flat list
+# query `[a, b]` prints one value per line, a list of lists `[[a, b]]` one
+# tab-separated row, and a missing value prints None.
 #
 # The resource group is created only through `az rest --method put` on its
 # URI. With --debug the fake logs the HTTP status (and a token prefix, as az
-# does). An existing group answers 412 to If-None-Match: *, unless
-# FAKE_AZ_IGNORE_IF_NONE_MATCH, when the PUT replaces its tags and answers 200.
-# FAKE_AZ_RACE: someone else creates the group just before the PUT.
+# does). As on live Azure, If-None-Match is ignored: a PUT on an existing
+# group replaces its tags and answers 200 (FAKE_AZ_HONOUR_IF_NONE_MATCH: it
+# answers 412 instead, as Azure might one day).
+# FAKE_AZ_RACE: someone else creates the group just before the PUT (after the
+# backend's existence read). FAKE_AZ_PREEXISTING: someone else's group of the
+# build's name exists before the build first names it.
 # FAKE_AZ_REST_FAIL_AFTER_APPLY: the PUT is applied, then az exits 1.
 # FAKE_AZ_TAG_UPDATE_FAIL=before|after: `tag update` fails without, or after,
 # applying the tags.
@@ -60,6 +68,10 @@ READY = "image-build-ssh-ready"
 # the PUT's own status. FAKE_AZ_DOUBLE_STATUS: the PUT's status is logged twice.
 # FAKE_AZ_REPLACE_AFTER_CREATE: between the 201 and the tag update the group
 # is replaced by someone else's of the same name, and the tag update fails.
+# `vm create` requires a credential (--ssh-key-values or --admin-password)
+# even with --specialized, as az 2.92 does. A Windows VM from a marketplace
+# image has its built-in Administrator (RID 500) renamed to the admin user,
+# so a run-command script that looks up 'Administrator' by name fails.
 FAKE_AZ = r'''#!/usr/bin/env python3
 import json, os, re, shlex, sys
 
@@ -144,10 +156,32 @@ if inject and inject.split("|")[0] == verb and faulted(verb):
 if verb in os.environ.get("FAKE_AZ_EMPTY", "").split(",") and faulted(verb):
     sys.exit(0)
 
-
 def gallery_key():
     return "/".join([sub, opt("--resource-group"), opt("--gallery-name"), opt("--gallery-image-definition")])
 
+
+def foreign(name, location="eastus"):
+    """Someone else's group of this name, with a resource in it."""
+    groups[name] = {"location": location, "tags": {"owner": "someone-else"},
+                    "vms": {"theirs": {"power": "running", "args": []}}}
+    save()
+
+
+def tsv(values):
+    """Print values the way `--query <q> -o tsv` does for q's shape. values
+    maps each expression in q to its value (None when missing)."""
+    def cell(v):
+        return "None" if v is None or v == "" else str(v)
+    q = query or ""
+    inner = re.fullmatch(r"\[\[(.*)\]\]", q)
+    flat = re.fullmatch(r"\[(.*)\]", q)
+    if inner:
+        print("\t".join(cell(values[e.strip()]) for e in inner.group(1).split(",")))
+    elif flat:
+        for e in flat.group(1).split(","):
+            print(cell(values[e.strip()]))
+    else:
+        print(cell(values[q]))
 
 if cmd == ("vm", "image", "show"):
     urn = opt("--urn")
@@ -158,18 +192,15 @@ if cmd == ("vm", "image", "show"):
     publisher, offer, sku, version = urn.split(":")
     if query == "name":
         print(os.environ.get("FAKE_AZ_LATEST", "24.04.202611010") if version == "latest" else version)
-    elif query == "[osDiskImage.operatingSystem, hyperVGeneration]":
-        print("%s\t%s" % ("Windows" if "Windows" in offer else "Linux", os.environ.get("FAKE_AZ_URN_GEN", "V2")))
     else:
-        fail("fake az: unexpected image query " + str(query), 2)
+        tsv({"osDiskImage.operatingSystem": "Windows" if "Windows" in offer else "Linux",
+             "hyperVGeneration": os.environ.get("FAKE_AZ_URN_GEN", "V2")})
 elif cmd == ("sig", "image-definition", "show"):
     d = state["definitions"].get(gallery_key())
     if d is None:
         not_found("ResourceNotFound", "The Resource 'Microsoft.Compute/galleries/%s/images/%s' was not found."
                   % (opt("--gallery-name"), opt("--gallery-image-definition")))
-    if query != "[osType, osState, hyperVGeneration]":
-        fail("fake az: unexpected definition query " + str(query), 2)
-    print("%s\t%s\t%s" % (d["osType"], d["osState"], d["hyperVGeneration"]))
+    tsv(d)
 elif cmd == ("sig", "image-definition", "create"):
     key = gallery_key()
     if key in state["definitions"]:
@@ -177,9 +208,18 @@ elif cmd == ("sig", "image-definition", "create"):
     for name in ("--location", "--publisher", "--offer", "--sku", "--os-type", "--os-state", "--hyper-v-generation"):
         if not opt(name):
             fail("fake az: definition create needs " + name, 2)
+    # az 2.92 adds SecurityType=TrustedLaunchSupported to a V2 definition
+    # unless --features names a SecurityType; SecurityType=Standard is dropped.
+    features = dict(f.split("=", 1) for f in opts("--features"))
+    security = features.pop("SecurityType", None)
+    if security is None and opt("--hyper-v-generation") == "V2":
+        security = "TrustedLaunchSupported"
+    if security == "Standard":
+        security = None
     state["definitions"][key] = {"osType": opt("--os-type"), "osState": opt("--os-state"),
                                  "hyperVGeneration": opt("--hyper-v-generation"),
-                                 "publisher": opt("--publisher"), "offer": opt("--offer"), "sku": opt("--sku")}
+                                 "publisher": opt("--publisher"), "offer": opt("--offer"), "sku": opt("--sku"),
+                                 "securityType": security}
     save()
 elif cmd == ("sig", "image-version", "show"):
     key = gallery_key() + "/" + opt("--gallery-image-version")
@@ -221,21 +261,22 @@ elif cmd == ("sig", "image-version", "create"):
         fail("ERROR: (InternalExecutionError) An internal execution error occurred.")
     save()
 elif cmd == ("group", "show"):
+    if os.environ.get("FAKE_AZ_PREEXISTING") and opt("--name") not in groups:
+        foreign(opt("--name"))
     g = groups.get(opt("--name"))
     if g is None:
         not_found("ResourceGroupNotFound", "Resource group '%s' could not be found." % opt("--name"))
-    names = re.fullmatch(r'\[(tags\."[a-z-]+"(, tags\."[a-z-]+")*)\]', query or "")
-    if not names:
-        fail("fake az: unexpected group query " + str(query), 2)
-    values = []
-    for key in re.findall(r'tags\."([a-z-]+)"', query):
-        value = g["tags"].get(key, "")
+    values = {"id": "/subscriptions/%s/resourceGroups/%s" % (sub, opt("--name"))}
+    for key in re.findall(r'tags\."([a-z-]+)"', query or ""):
+        value = g["tags"].get(key)
         if key == "image-build" and os.environ.get("FAKE_AZ_SHOW_TAG"):
             value = os.environ["FAKE_AZ_SHOW_TAG"]
         if key == "image-build-expires" and os.environ.get("FAKE_AZ_SHOW_EXPIRES"):
             value = os.environ["FAKE_AZ_SHOW_EXPIRES"]
-        values.append(value)
-    print("\t".join(values))
+        values['tags."%s"' % key] = value
+    if query not in values and not re.fullmatch(r"\[\[?(tags\.\"[a-z-]+\"(, )?)+\]\]?", query or ""):
+        fail("fake az: unexpected group query " + str(query), 2)
+    tsv(values)
 elif cmd == ("rest",):
     m = re.fullmatch(r"/subscriptions/([^/]+)/resourcegroups/([^/?]+)\?api-version=2021-04-01", opt("--url") or "")
     if opt("--method") != "put" or not m or opt("--headers") != "If-None-Match=*":
@@ -261,16 +302,15 @@ elif cmd == ("rest",):
         status(403)
         fail('ERROR: Forbidden({"error":{"code":"AuthorizationFailed","message":"not allowed"}})')
     body = json.loads(opt("--body"))
-    if os.environ.get("FAKE_AZ_RACE") and name not in groups:
-        groups[name] = {"location": body["location"], "tags": {"owner": "someone-else"},
-                        "vms": {"theirs": {"power": "running", "args": []}}}
+    if (os.environ.get("FAKE_AZ_RACE") or os.environ.get("FAKE_AZ_PREEXISTING")) and name not in groups:
+        foreign(name, body["location"])
     tags = dict(body["tags"])
     if name in groups:
-        if not os.environ.get("FAKE_AZ_IGNORE_IF_NONE_MATCH"):
+        if os.environ.get("FAKE_AZ_HONOUR_IF_NONE_MATCH"):
             save()
             status(412)
             fail('ERROR: Precondition Failed({"error":{"code":"PreconditionFailed"}})')
-        # A PUT replaces the group's tags.
+        # Azure ignores If-None-Match here: the PUT replaces the group's tags.
         groups[name]["tags"] = tags
         save()
         status(200)
@@ -321,7 +361,8 @@ elif cmd == ("group", "list"):
     for name, g in sorted(groups.items()):
         if opt("--tag") and opt("--tag") not in g["tags"]:
             continue
-        print("\t".join([name] + [g["tags"].get(k, "") for k in keys]))
+        # One row per group (a list of lists); a missing tag prints None.
+        print("\t".join([name] + [g["tags"].get(k) or "None" for k in keys]))
 elif cmd == ("vm", "create"):
     g = groups.get(opt("--resource-group"))
     if g is None:
@@ -330,10 +371,19 @@ elif cmd == ("vm", "create"):
         fail("fake az: VM location differs from its group", 2)
     if fail_on == "vm-create-nothing":
         fail("ERROR: (QuotaExceeded) quota exceeded")
+    # az 2.92 validates a credential before anything else, --specialized or not.
+    if "--ssh-key-values" not in args and "--admin-password" not in args:
+        fail("ERROR: An RSA key file or key value must be supplied to SSH Key Value. "
+             "You can use --generate-ssh-keys to let CLI generate one for you")
     if "--admin-password" in args:
         with open(log + ".secret", "a") as out:
             out.write(from_file(opt("--admin-password"), "--admin-password") + "\n")
-    g["vms"][opt("--name")] = {"power": "running", "args": args}
+    g["vms"][opt("--name")] = {"power": "running", "args": args,
+                               # The built-in Administrator (RID 500) of a Windows
+                               # VM made from an image Azure provisions: renamed to
+                               # the admin user. A specialized image keeps its own.
+                               "rid500": "Administrator" if "--specialized" in args
+                               else opt("--admin-username")}
     # Someone retags the build group once the build is under way.
     for env_key, tag in (("FAKE_AZ_RETAG_TAG", "image-build"), ("FAKE_AZ_RETAG_EXPIRES", "image-build-expires"),
                          ("FAKE_AZ_RETAG_OWNER", "image-build-owner"),
@@ -353,8 +403,14 @@ elif cmd == ("vm", "run-command", "invoke"):
     with open(log + ".scripts", "a") as out:
         out.write("--- " + opt("--command-id") + "\n" + script)
     ok = "image-build-ssh-ready" in script and not os.environ.get("FAKE_AZ_RUNCMD_FAIL")
+    err = "Add-WindowsCapability : access denied"
+    if (opt("--command-id") == "RunPowerShellScript" and vm.get("rid500") != "Administrator"
+            and "Get-LocalUser -Name 'Administrator'" in script):
+        # $ErrorActionPreference = 'Stop': the script ends here.
+        ok = False
+        err = "Get-LocalUser : User Administrator was not found."
     print("Enable succeeded: \n[stdout]\n%s\n[stderr]\n%s" % (
-        "image-build-ssh-ready" if ok else "", "" if ok else "Add-WindowsCapability : access denied"))
+        "image-build-ssh-ready" if ok else "", "" if ok else err))
 elif cmd == ("vm", "show"):
     vm = groups.get(opt("--resource-group"), {}).get("vms", {}).get(opt("--name"))
     if vm is None:
@@ -530,6 +586,12 @@ def test_azure_create_own_group_tags_and_subnet(tmp_path):
     readback = next(a for a in calls[calls.index(update):] if _verb(a) == "group show")
     assert _opt(readback, "--name") == run_id
     assert "group create" not in [_verb(a) for a in calls]
+    # A fail-closed existence read comes right before the PUT: Azure ignores
+    # If-None-Match on resource groups, so the PUT alone would retag an
+    # existing group.
+    exists = calls[calls.index(put) - 1]
+    assert exists == ["group", "show", "--subscription", SUB, "--name", run_id, "--query", "id",
+                      "--output", "tsv"], exists
     assert calls.index(put) < calls.index(update) < calls.index(readback) < calls.index(_one(tmp_path, "vm create"))
     # The debug log (it holds a token prefix) never reaches the output.
     assert "Bearer" not in result.stderr and "Response status" not in result.stderr
@@ -593,6 +655,15 @@ def test_azure_windows_run_command_installs_openssh(tmp_path):
                    "*S-1-5-32-544:F", "*S-1-5-18:F", "Start-Service", "sshd",
                    "-LocalPort 22", "Enable-LocalUser", "RandomNumberGenerator", f"'{PUBKEY}'"):
         assert needle in scripts, needle
+    # Azure renamed the built-in Administrator (RID 500) to builder: the
+    # script finds it by SID, names it Administrator again and gives it a
+    # fresh random password (made in the guest, never output). Looking it up
+    # by name fails on Azure (the fake does as Azure did live).
+    for needle in ("$_.SID.Value.EndsWith('-500')", "Rename-LocalUser -SID $admin.SID -NewName 'Administrator'",
+                   "if ($renamed -or -not $admin.Enabled)", "Set-LocalUser -Name 'Administrator' -Password $secure"):
+        assert needle in scripts, needle
+    assert "Get-LocalUser -Name 'Administrator'" not in scripts
+    assert "Write-Host" not in scripts and "Write-Output $" not in scripts
     assert scripts.rstrip().endswith(f"Write-Output '{READY}'")
     assert any(l.startswith("ssh ") and f" Administrator@{PUBLIC_IP} " in l
                for l in _calls(tmp_path).splitlines())
@@ -627,36 +698,48 @@ def test_azure_windows_run_command_installs_openssh(tmp_path):
 
 
 def test_azure_specialized_gallery_base(tmp_path):
-    # A base this backend built (specialized): no admin profile; the key goes
-    # in through run-command, for builder.
-    base_def = "docker-host"
-    base_id = (f"/subscriptions/{OTHER_SUB}/resourceGroups/base-rg/providers/Microsoft.Compute/galleries/"
-               f"base_gallery/images/{base_def}/versions/2026.1101.1200")
-    env, recipe = _azure_env(tmp_path, BASE_AZURE=base_id)
-    _seed(tmp_path, definitions={
-        f"{OTHER_SUB}/base-rg/base_gallery/{base_def}": {"osType": "Linux", "osState": "Specialized",
-                                                          "hyperVGeneration": "V1"}},
-        versions={f"{OTHER_SUB}/base-rg/base_gallery/{base_def}/2026.1101.1200": {"state": "Succeeded"}})
-    result = _build(env, recipe, "azure")
-    assert result.returncode == 0, result.stderr
-    # The base is read in its own subscription.
-    show = [a for a in _az(tmp_path) if _verb(a) == "sig image-version show"
-            and _opt(a, "--gallery-name") == "base_gallery"]
-    assert len(show) == 1 and _opt(show[0], "--subscription") == OTHER_SUB
-    vm = _one(tmp_path, "vm create")
-    assert _opt(vm, "--image") == base_id
-    assert "--specialized" in vm
-    for absent in ("--admin-username", "--admin-password", "--ssh-key-values", "--computer-name"):
-        assert absent not in vm, absent
-    run = _one(tmp_path, "vm run-command invoke")
-    assert _opt(run, "--command-id") == "RunShellScript"
-    scripts = _text(tmp_path, "scripts")
-    assert f"key='{PUBKEY}'" in scripts and "/home/builder/.ssh/authorized_keys" in scripts
-    assert scripts.rstrip().endswith(f"echo '{READY}'")
-    assert any(f" builder@{PUBLIC_IP} " in l for l in _calls(tmp_path).splitlines() if l.startswith("ssh "))
+    # A base this backend built (specialized): created with --specialized,
+    # and still with a credential, which az 2.92 demands even then (and then
+    # leaves out of the VM); the key goes in through run-command.
+    def build(sub, os_family, definition, script_id, script_needles):
+        base_id = (f"/subscriptions/{OTHER_SUB}/resourceGroups/base-rg/providers/Microsoft.Compute/galleries/"
+                   f"base_gallery/images/{definition}/versions/2026.1101.1200")
+        env, recipe = _azure_env(tmp_path / sub, os_family, BASE_AZURE=base_id)
+        _seed(tmp_path / sub, definitions={
+            f"{OTHER_SUB}/base-rg/base_gallery/{definition}": {
+                "osType": "Windows" if os_family == "windows" else "Linux", "osState": "Specialized",
+                "hyperVGeneration": "V1"}},
+            versions={f"{OTHER_SUB}/base-rg/base_gallery/{definition}/2026.1101.1200": {"state": "Succeeded"}})
+        result = _build(env, recipe, "azure")
+        assert result.returncode == 0, (sub, result.stderr)
+        # The base is read in its own subscription.
+        show = [a for a in _az(tmp_path / sub) if _verb(a) == "sig image-version show"
+                and _opt(a, "--gallery-name") == "base_gallery"]
+        assert len(show) == 1 and _opt(show[0], "--subscription") == OTHER_SUB
+        vm = _one(tmp_path / sub, "vm create")
+        assert _opt(vm, "--image") == base_id
+        assert "--specialized" in vm
+        assert "--computer-name" not in vm
+        run = _one(tmp_path / sub, "vm run-command invoke")
+        assert _opt(run, "--command-id") == script_id
+        scripts = _text(tmp_path / sub, "scripts")
+        for needle in script_needles:
+            assert needle in scripts, (sub, needle)
+        return vm
+
+    vm = build("linux", "linux", "docker-host", "RunShellScript",
+               (f"key='{PUBKEY}'", "/home/builder/.ssh/authorized_keys", f"echo '{READY}'"))
+    assert _opt(vm, "--admin-username") == "builder" and Path(_opt(vm, "--ssh-key-values")).name == "key.pub"
+    assert "--admin-password" not in vm
+    assert any(f" builder@{PUBLIC_IP} " in l for l in _calls(tmp_path / "linux").splitlines() if l.startswith("ssh "))
     # The new definition takes the base's generation.
-    definition = _state(tmp_path)["definitions"][_gallery_key("example-lab-linux")]
+    definition = _state(tmp_path / "linux")["definitions"][_gallery_key("example-lab-linux")]
     assert definition["hyperVGeneration"] == "V1"
+
+    vm = build("windows", "windows", "win-host", "RunPowerShellScript", (f"'{PUBKEY}'", f"Write-Output '{READY}'"))
+    assert _opt(vm, "--admin-username") == "builder" and _opt(vm, "--admin-password").startswith("@")
+    assert "--ssh-key-values" not in vm
+    assert list((tmp_path / "windows" / "tmp").iterdir()) == []
 
 
 def test_azure_resolve_base(tmp_path):
@@ -764,6 +847,10 @@ def test_azure_leftovers_only_tagged_expired(tmp_path):
     for name in [*bad_expiry, *(_rid("202601010000", c) for c in "efc0")]:
         assert f"resource group {name}:" in result.stderr, name
     assert young not in result.stderr
+    # az prints a missing tag as None; it reads as empty, never as a value.
+    assert f"resource group {_rid('202601010000', 'c')}: image-build-owner='0123456789abcdef0123456789abcdef' " \
+           "and image-build-creating='' are not one creation token" in result.stderr, result.stderr
+    assert "'None'" not in result.stderr
 
     result = _build(env, "--reap", "azure")
     assert result.returncode == 0, result.stderr
@@ -845,7 +932,9 @@ def test_azure_destroy_rechecks_tags(tmp_path):
     result = _build(env, recipe, "azure")
     assert result.returncode == 1
     verbs = [_verb(a) for a in _az(tmp_path / "nothing")]
-    assert verbs[-1] == "rest" and "group delete" not in verbs and "group show" not in verbs
+    # The only group read is the existence check before the PUT.
+    assert verbs[-2:] == ["group show", "rest"] and verbs.count("group show") == 1, verbs
+    assert "group delete" not in verbs
     assert "AuthorizationFailed" in result.stderr and "HTTP 403" in result.stderr
     assert "could not destroy" not in result.stderr
     assert "Bearer" not in result.stderr
@@ -865,41 +954,59 @@ def _reap_later(tmp_path: Path, env: dict):
 
 
 def test_azure_group_create_is_create_only(tmp_path):
-    """`az group create` is an upsert: a same-name group made by anyone before
-    the create would be adopted, retagged and later deleted. The group is PUT
-    with If-None-Match: * and only the tag image-build-creating, which no reap
-    matches; only a confirmed 201 Created makes it this run's. Whatever an
-    ambiguous or failed create leaves, a later reap can neither list nor
-    delete it."""
+    """`az group create` is an upsert, and Azure ignores If-None-Match on a
+    resource-group PUT (an existing group answers 200 and loses its tags). So
+    a fail-closed read refuses an existing group before the PUT, and the PUT
+    carries only image-build-creating, which no reap matches; only a
+    confirmed 201 Created makes the group this run's. Whatever an ambiguous
+    or failed create leaves, a later reap can neither list nor delete it."""
     def foreign_intact(sub):
         return _state(tmp_path / sub)["groups"][_run_id(tmp_path / sub)]["vms"] == {
             "theirs": {"power": "running", "args": []}}
 
-    # Someone creates the group just before the PUT; Azure honours the
-    # condition (412): nothing changed, nothing owned, nothing deleted.
+    # Someone else's group of the build's name already exists: the read
+    # before the PUT refuses it, and nothing is written to it.
+    env, recipe = _azure_env(tmp_path / "exists")
+    env["FAKE_AZ_PREEXISTING"] = "1"
+    result = _build(env, recipe, "azure")
+    assert result.returncode == 1
+    assert "already exists; not used, not changed" in result.stderr, result.stderr
+    calls = _az(tmp_path / "exists")
+    verbs = [_verb(a) for a in calls]
+    assert verbs[-1] == "group show" and _opt(calls[-1], "--query") == "id", calls[-1]
+    assert not {"rest", "tag update", "vm create", "group delete"} & set(verbs), verbs
+    name = _opt(calls[-1], "--name")
+    assert RUN_ID_RE.match(name), name
+    assert _state(tmp_path / "exists")["groups"][name] == {
+        "location": LOCATION, "tags": {"owner": "someone-else"},
+        "vms": {"theirs": {"power": "running", "args": []}}}
+
+    # Someone creates the group between that read and the PUT, and Azure
+    # honours the condition (412; it does not today): nothing changed,
+    # nothing owned, nothing deleted.
     env, recipe = _azure_env(tmp_path / "race")
-    env["FAKE_AZ_RACE"] = "1"
+    env.update(FAKE_AZ_RACE="1", FAKE_AZ_HONOUR_IF_NONE_MATCH="1")
     result = _build(env, recipe, "azure")
     assert result.returncode == 1
     assert "already exists; not used, not changed" in result.stderr
     verbs = [_verb(a) for a in _az(tmp_path / "race")]
     assert verbs[-1] == "rest", verbs
-    assert not {"vm create", "group show", "group delete", "tag update"} & set(verbs)
+    assert not {"vm create", "group delete", "tag update"} & set(verbs)
     group = _state(tmp_path / "race")["groups"][_run_id(tmp_path / "race")]
     assert group["tags"] == {"owner": "someone-else"}
     assert foreign_intact("race")
 
-    # The same race where Azure ignores the condition and replaces the
-    # group's tags (200): with az reporting success, with az failing after
-    # the server applied it, and with a tag write that would fail. None of
-    # them owns the group, writes to it again or deletes it, and a reap run
-    # long after the build's expiry neither lists nor deletes it.
+    # The same race as Azure behaves today: the PUT replaces the group's tags
+    # (200): with az reporting success, with az failing after the server
+    # applied it, and with a tag write that would fail. None of them owns the
+    # group, writes to it again or deletes it, and a reap run long after the
+    # build's expiry neither lists nor deletes it.
     for sub, extra, said in (("upsert", {}, "HTTP 200, not a confirmed 201"),
                              ("upsert-az-fails", {"FAKE_AZ_REST_FAIL_AFTER_APPLY": "1"}, "az exit 1, HTTP 200"),
                              ("upsert-tag-fails", {"FAKE_AZ_TAG_UPDATE_FAIL": "before"},
                               "HTTP 200, not a confirmed 201")):
         env, recipe = _azure_env(tmp_path / sub)
-        env.update(FAKE_AZ_RACE="1", FAKE_AZ_IGNORE_IF_NONE_MATCH="1", **extra)
+        env.update(FAKE_AZ_RACE="1", **extra)
         result = _build(env, recipe, "azure")
         assert result.returncode == 1, sub
         assert said in result.stderr, (sub, result.stderr)
@@ -935,8 +1042,7 @@ def test_azure_group_create_is_create_only(tmp_path):
     # The PUT answered 200 (a takeover), but another request's 201 is logged
     # after it; or a fresh create whose status line appears twice. Neither is
     # a 201 for this request: nothing owned, tagged or deleted, nothing reapable.
-    for sub, extra in (("stray-201", {"FAKE_AZ_RACE": "1", "FAKE_AZ_IGNORE_IF_NONE_MATCH": "1",
-                                      "FAKE_AZ_STRAY_201": "1"}),
+    for sub, extra in (("stray-201", {"FAKE_AZ_RACE": "1", "FAKE_AZ_STRAY_201": "1"}),
                        ("double-status", {"FAKE_AZ_DOUBLE_STATUS": "1"})):
         env, recipe = _azure_env(tmp_path / sub)
         env.update(extra)
@@ -966,8 +1072,11 @@ def test_azure_post_create_tagging_failure(tmp_path):
     envs = {}
     for sub, extra in (("tag-fails", {"FAKE_AZ_TAG_UPDATE_FAIL": "before"}),
                        ("tag-applied-az-fails", {"FAKE_AZ_TAG_UPDATE_FAIL": "after"}),
-                       ("readback-empty", {"FAKE_AZ_EMPTY": "group show"}),
-                       ("readback-denied", {"FAKE_AZ_ERROR": "group show|AuthorizationFailed|1"}),
+                       # FAKE_AZ_FAULT_SKIP=1: the existence read before the
+                       # PUT goes through; the fault hits the read-back.
+                       ("readback-empty", {"FAKE_AZ_EMPTY": "group show", "FAKE_AZ_FAULT_SKIP": "1"}),
+                       ("readback-denied", {"FAKE_AZ_ERROR": "group show|AuthorizationFailed|1",
+                                            "FAKE_AZ_FAULT_SKIP": "1"}),
                        ("replaced", {"FAKE_AZ_REPLACE_AFTER_CREATE": "fail"}),
                        ("replaced-merged", {"FAKE_AZ_REPLACE_AFTER_CREATE": "merge"}),
                        ("replaced-merged-az-fails", {"FAKE_AZ_REPLACE_AFTER_CREATE": "merge-error"})):
@@ -1008,15 +1117,32 @@ def test_azure_post_create_tagging_failure(tmp_path):
 def test_azure_reads_fail_closed(tmp_path):
     """Only an exact not-found code (with az's exit 3) reads as absent; an
     empty or malformed success never reads as found-and-fine."""
+    # The existence read before the group PUT: only exit 3 with exactly
+    # ResourceGroupNotFound lets the build go on. Any other failure stops it,
+    # and so does an empty success (a group was found); no PUT is sent.
+    for sub, extra, message in (
+            ("pre-auth", {"FAKE_AZ_ERROR": "group show|AuthorizationFailed|1"}, "not treated as absent"),
+            ("pre-subscription", {"FAKE_AZ_ERROR": "group show|SubscriptionNotFound|3"}, "not treated as absent"),
+            ("pre-not-exit-3", {"FAKE_AZ_ERROR": "group show|ResourceGroupNotFound|1"}, "not treated as absent"),
+            ("pre-empty", {"FAKE_AZ_EMPTY": "group show"}, "already exists; not used, not changed")):
+        env, recipe = _azure_env(tmp_path / sub)
+        env.update(extra)
+        result = _build(env, recipe, "azure")
+        assert result.returncode == 1, sub
+        assert message in result.stderr, (sub, result.stderr)
+        verbs = [_verb(a) for a in _az(tmp_path / sub)]
+        assert verbs[-1] == "group show" and "rest" not in verbs, (sub, verbs)
+
     # Cleanup after a failed verify: a group read that fails for any other
     # reason keeps the group and says to reap. (FAKE_AZ_FAULT_SKIP lets the
-    # read-back after the create through; the fault hits the cleanup's read.)
+    # existence read and the read-back after the create through; the fault
+    # hits the cleanup's read.)
     for sub, error in (("subscription", "group show|SubscriptionNotFound|3"),
                        ("auth", "group show|AuthorizationFailed|1"),
                        ("tenant", "group show|InvalidAuthenticationTokenTenant|1"),
                        ("not-exit-3", "group show|ResourceGroupNotFound|1")):
         env, recipe = _azure_env(tmp_path / sub)
-        env.update(FAKE_SSH_FAIL_ON="verify.sh", FAKE_SSH_FAIL_RC="3", FAKE_AZ_ERROR=error, FAKE_AZ_FAULT_SKIP="1")
+        env.update(FAKE_SSH_FAIL_ON="verify.sh", FAKE_SSH_FAIL_RC="3", FAKE_AZ_ERROR=error, FAKE_AZ_FAULT_SKIP="2")
         result = _build(env, recipe, "azure")
         assert result.returncode == 1, sub
         assert "not treated as absent" in result.stderr, (sub, result.stderr)
@@ -1027,7 +1153,7 @@ def test_azure_reads_fail_closed(tmp_path):
     # A group read that succeeds but prints nothing is not this run's group.
     env, recipe = _azure_env(tmp_path / "empty")
     env.update(FAKE_SSH_FAIL_ON="verify.sh", FAKE_SSH_FAIL_RC="3", FAKE_AZ_EMPTY="group show",
-               FAKE_AZ_FAULT_SKIP="1")
+               FAKE_AZ_FAULT_SKIP="2")
     result = _build(env, recipe, "azure")
     assert result.returncode == 1
     assert "not deleted" in result.stderr and "could not destroy" in result.stderr
@@ -1053,7 +1179,13 @@ def test_azure_reads_fail_closed(tmp_path):
              "cannot tell whether it exists"),
             ("d-parent", {"FAKE_AZ_ERROR": "sig image-definition show|ParentResourceNotFound|3"},
              "not treated as absent"),
-            ("d-empty", {"FAKE_AZ_EMPTY": "sig image-definition show"}, "not its OS type, state and generation")):
+            ("d-empty", {"FAKE_AZ_EMPTY": "sig image-definition show"}, "not its OS type, state and generation"),
+            # Live az answers a missing gallery item with ResourceNotFound
+            # only; any other "not found" code fails closed.
+            ("v-gallery-code", {"FAKE_AZ_ERROR": "sig image-version show|GalleryImageVersionNotFound|3"},
+             "not treated as absent"),
+            ("d-gallery-code", {"FAKE_AZ_ERROR": "sig image-definition show|GalleryImageNotFound|3"},
+             "not treated as absent")):
         env, recipe = _azure_env(tmp_path / sub)
         env.update(extra)
         result = _build(env, recipe, "azure")
@@ -1094,8 +1226,13 @@ def test_azure_save_deallocates_before_publishing(tmp_path):
     # specialized, with the base's generation.
     assert verbs.index("sig image-version show") < verbs.index("sig image-definition show") < dealloc
     definition = _state(tmp_path)["definitions"][_gallery_key("example-lab-linux")]
+    # No Trusted Launch feature: az would default a V2 definition to
+    # SecurityType=TrustedLaunchSupported; SecurityType=Standard keeps it plain.
+    create = _one(tmp_path, "sig image-definition create")
+    assert _opts(create, "--features") == ["SecurityType=Standard"]
     assert definition == {"osType": "Linux", "osState": "Specialized", "hyperVGeneration": "V2",
-                          "publisher": "image-build", "offer": "example-lab-linux", "sku": "example-lab-linux"}
+                          "publisher": "image-build", "offer": "example-lab-linux", "sku": "example-lab-linux",
+                          "securityType": None}
     assert "generalize" not in " ".join(verbs) and "sysprep" not in _calls(tmp_path)
     assert _state(tmp_path)["versions"][_gallery_key("example-lab-linux") + "/" + version]["tags"] == {
         "image-build-recipe": "labs/demo/recipe.env", "image-build-commit": "abc1234"}

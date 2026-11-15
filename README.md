@@ -1,7 +1,8 @@
 # lab-image-builder
 
 Builds VM images for lab environments from a recipe, on Proxmox, AWS, GCP or
-Azure (the Azure backend is tested against a fake `az` only so far).
+Azure (the Azure backend has run live for Linux; no Windows image has been
+built on Azure yet).
 It is plain bash plus each platform's own CLI: no Packer, Vagrant, Ansible or
 Terraform, and no disk conversion. Each backend builds from its own base, so
 one recipe yields one native image per platform.

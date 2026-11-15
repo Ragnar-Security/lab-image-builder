@@ -339,7 +339,7 @@ before the delete.
   `image-build=<RUN_ID>` (pending, running, stopping or stopped) and
   terminates each through the same check, so another run's instance is never
   touched. On Azure the unit is the build's resource group, and the build
-  owns it only if Azure answered its create-only PUT with `201 Created` (see
+  owns it only if Azure answered its group PUT with `201 Created` (see
   "Azure"); the cleanup deletes it only while its name, `image-build`,
   `image-build-expires`, `image-build-owner` and `image-build-creating` all
   still match this run (the last two must both be the run's 128-bit nonce).
@@ -663,25 +663,44 @@ labels are on the instance; the image carries `image-build-recipe` and
 
 ### Azure
 
-**Built and tested against a fake `az` only.** No Azure account existed when
-it was written (2026-11-14); see "What only a live run can prove" below
-before relying on it.
+**Tested against a fake `az`, and run live once** (2026-11-15, `eastus`,
+`az` 2.92.0): Linux builds, the reboot protocol, a failed verify, a killed
+build plus `--reap`, and a build from a specialized gallery base all passed
+with the fixes that run found (below). No Windows image has been produced on
+Azure yet; see "Open questions" below before relying on one.
 
 Each build gets its own resource group, named after the run ID
 (`ib-<yyyymmddhhmm>-<16 hex>`), in `AZ_BUILD_LOCATION` and tagged
 `image-build`, `image-build-expires`, `image-build-owner` and
 `image-build-creating`; the last two hold the same 128-bit nonce made for
-the run. **The group is created create-only.** `az group
-create` is a create-or-update: a group of the same name made by anyone
-between a check and the create would be adopted, retagged, and deleted by
-the cleanup. So the backend sends `az rest --method put` on the group's URI
-with `If-None-Match: *` and `--debug`, reads the HTTP status from the debug
-log (kept in the run's temp directory and deleted at once: it holds a
-prefix of the access token), and owns the group only on `201 Created`. The
-status counts only if it is the one `Response status:` line that follows a
-`Request URL:` line naming exactly this group's URI with method `PUT`; a
-status from any other request (a token fetch, say) is ignored, and none or
-more than one such line reads as unknown.
+the run.
+
+**There is no create-only primitive for a resource group.** `az group
+create` is a create-or-update, and Azure ignores `If-None-Match: *` (and
+`If-Match`) on a resource-group PUT: a PUT on an existing group answers
+`200` and replaces all its tags (seen live; a resource group has no etag).
+So the backend:
+
+1. Reads the group first, fail-closed: only `az` exit 3 with exactly
+   `ResourceGroupNotFound` lets the build go on. A group that exists is
+   refused and left unchanged; any other error stops the build.
+2. Sends `az rest --method put` on the group's URI with `--debug` (and still
+   `If-None-Match: *`, in case Azure ever honours it), reads the HTTP status
+   from the debug log (kept in the run's temp directory and deleted at once:
+   it holds a prefix of the access token), and owns the group only on
+   `201 Created`. The status counts only if it is the one `Response status:`
+   line that follows a `Request URL:` line naming exactly this group's URI
+   with method `PUT`; a status from any other request (a token fetch, say)
+   is ignored, and none or more than one such line reads as unknown.
+
+**The residual race** is a group created under the same name between the
+read and the PUT, a second or two. The name carries 64 random bits and is
+not published before the PUT, so that takes a 2⁻⁶⁴ coincidence, or someone
+who can read the build host and already holds `resourceGroups/write` in the
+subscription (and could retag anything anyway). If it happens, that group's
+tags are replaced by the creation token, the PUT answers `200`, and the
+build stops: the group is never owned, deleted or reaped; its other tags
+are lost, its resources untouched.
 
 **The PUT is non-reapable by construction.** Its only tag is the creation
 token `image-build-creating=<nonce>`: no `image-build`, no expiry, no owner
@@ -698,18 +717,25 @@ cleanup and the reap all require `image-build-creating == image-build-owner
 == nonce`. A replacement that received only the Merge lacks the token and is
 never owned, deleted or reaped.
 
-| Answer | Result |
+| PUT answer | Result |
 |---|---|
 | `201` | Created by this run. Only now does the build merge on `image-build`, `image-build-expires` and `image-build-owner` (`az tag update --operation Merge`), read all four tags back, and, if they are exactly this run's with the creation token intact, own the group (deleted at the end). If the tag write fails or the read-back does not show this run's four tags, **nothing is deleted**: a parsed `201` is history (the group could have been replaced since, or the status misread), so the build stops and names the group with the `az group delete` command for a hand cleanup. An empty resource group costs nothing; a group without both nonces is invisible to `--reap`. |
-| `412` | The group exists; nothing was changed; the build stops. |
-| Another error, `200`, or no readable status | Nothing owned, nothing written again, nothing deleted; the build stops and names the group. A `200` means Azure ignored the condition and replaced an existing group's tags with `image-build-creating`: the original tags are lost; check the group by hand. A group Azure created while `az` reported an error is empty and carries only `image-build-creating`; delete it by hand. |
+| `200` | The race above: an existing group's tags were replaced with `image-build-creating`. Nothing owned, written again or deleted; the build stops and names the group; check it by hand. |
+| `412` | Not seen live (Azure ignores the header); kept as a defence. The group exists; nothing was changed; the build stops. |
+| Another error, or no readable status | Nothing owned, written again or deleted; the build stops and names the group. A group Azure created while `az` reported an error is empty and carries only `image-build-creating`; delete it by hand. |
+
+Every tag read uses a list-of-lists query (`--query '[[a, b]]'`): with
+`-o tsv`, `az` prints a flat list `[a, b]` one value per line, and a list of
+lists as one tab-separated row. A missing tag prints `None`, which the
+backend reads as empty.
 
 The VM (same name) is created in it from `BASE_AZURE`, size `AZURE_VM_SIZE`,
 OS disk `AZURE_DISK_GB` or `DISK_GB`, security type `Standard`, with its NIC
 in `AZ_BUILD_SUBNET_ID`, **no NIC-level NSG** (`--nsg ""`; `az vm create`
 would otherwise open `tcp/22` to the internet) and a Standard static public
 IP in the same group. Every `az` call names `--subscription`, except the
-group PUT, whose URI names it.
+group PUT, whose URI names it. A static public IP is kept across
+`az vm restart`.
 
 - **Linux:** Azure creates the admin user `builder` with the run's public key
   (`--ssh-key-values`, a file) and passwordless sudo.
@@ -717,28 +743,34 @@ group PUT, whose URI names it.
   gets a random password generated on the build host, written to the run's
   temp directory (mode 600) and passed as `--admin-password @<file>`, so it
   is never on a command line, printed, logged or kept (the temp directory is
-  deleted on exit). Then `az vm run-command invoke --command-id
+  deleted on exit). Azure gives that name to the built-in Administrator
+  (RID 500): there is no separate `builder` account, and no account called
+  `Administrator`. Then `az vm run-command invoke --command-id
   RunPowerShellScript` runs the GCP backend's OpenSSH script: it installs
-  OpenSSH Server, writes the key to `administrators_authorized_keys`, enables
-  the built-in `Administrator` with a password generated in the guest, starts
-  `sshd` and opens `tcp/22`. The build logs in as `Administrator`. The
-  `builder` account stays in the image, enabled, with that discarded
-  password.
+  OpenSSH Server, writes the key to `administrators_authorized_keys`, finds
+  the RID-500 account by its SID, renames it back to `Administrator` (the
+  seal and the payloads use that name) and gives it a fresh random password
+  generated in the guest and never output, starts `sshd` and opens
+  `tcp/22`. The build logs in as `Administrator`. Azure Windows images
+  therefore contain no `builder` account.
 - **run-command reports success even when the script failed**, so each
   script prints `image-build-ssh-ready` as its last step and the build fails
   without it.
 - **A specialized gallery base** (an image this backend built, with
-  `KEEP_SSH=yes`) takes no admin profile. The VM is created with
-  `--specialized`, and run-command writes the key: `RunShellScript` into
-  `builder`'s `authorized_keys` on Linux, the same OpenSSH script on Windows.
-  Such a base must have been built with `KEEP_SSH=yes`, or `sshd` is off.
+  `KEEP_SSH=yes`) is created with `--specialized`. `az` 2.92 still demands
+  a credential then (an SSH key, or a password on Windows) and leaves it out
+  of the VM, so the build passes the run's key or generated password anyway,
+  and run-command writes the key: `RunShellScript` into `builder`'s
+  `authorized_keys` on Linux, the same OpenSSH script on Windows. Such a
+  base must have been built with `KEEP_SSH=yes`, or `sshd` is off.
 
 A setup that exits 100 is rebooted with `az vm restart`. **Save:** the
 backend refuses an existing version of the same name (it never overwrites),
 checks the image definition `IMAGE_PREFIX` in the gallery (it must be
 `Specialized`, of the recipe's OS type and the base's Hyper-V generation) or
 creates it (`--publisher image-build --offer <IMAGE_PREFIX> --sku
-<IMAGE_PREFIX>`), **deallocates the VM**, then publishes a **specialized**
+<IMAGE_PREFIX> --features SecurityType=Standard`: without it `az` 2.92
+marks a V2 definition `TrustedLaunchSupported`), **deallocates the VM**, then publishes a **specialized**
 image version from it (`az sig image-version create --virtual-machine`): no
 generalize, no sysprep, as on AWS and Proxmox. The version is
 `<yyyy>.<mmdd>.<hhmm>` of the build timestamp as integers (a build at
@@ -749,11 +781,24 @@ tags. `IMAGE_ID` is the version's resource ID. A version whose create failed
 or did not reach `Succeeded` is left in place and not logged, and the error
 prints the `az sig image-version delete` command for it. The two existence
 reads before the save fail closed: a version or definition counts as absent
-only when `az` exits 3 with exactly `ResourceNotFound`,
-`GalleryImageNotFound` or `GalleryImageVersionNotFound`; any other error,
+only when `az` exits 3 with exactly `ResourceNotFound` (the only code `az`
+2.92 returns for a missing gallery, definition or version); any other error,
 and a successful answer that is empty or malformed (a version ID that is
 not this version's, a definition without a valid OS type, state and
-generation), stops the build before the VM is deallocated.
+generation), stops the build before the VM is deallocated. Publishing a
+version takes about 8 to 10 minutes of a 12-minute Linux build.
+
+**What a sealed Azure image keeps.**
+
+- **The Azure VM agent** (`walinuxagent` on Linux, the guest agent on
+  Windows) stays installed and running. Anyone with
+  `Microsoft.Compute/virtualMachines/runCommand/action` on a VM made from
+  the image runs code in it as root or SYSTEM. This is the same class as
+  the SSM agent on AWS and the guest agent on GCP: decide whether the
+  portal's Azure identity ever holds that right on lab VMs.
+- **The build VM's hostname.** A specialized image is never re-provisioned,
+  so every clone keeps it (`ib-<yyyymmddhhmm>-<16 hex>` on Linux, the
+  15-character `ib-<ddhhmm>-<4 hex>` computer name on Windows).
 
 `--reap azure` lists the subscription's resource groups that carry an
 `image-build` tag. IDs are group names. `templates.yaml` gets
@@ -780,38 +825,30 @@ generation), stops the build before the VM is deallocated.
 4. `az login` (or a service principal) on the build host, and the
    subscription ID in `config.env`.
 
-**What only a live run can prove** (none of this has run against Azure):
+**What the live run proved** (2026-11-15): `latest` resolves and the base's
+Hyper-V generation reads correctly; `az` accepts `--security-type Standard`,
+`--nsg ""` and `@file` values; the Linux `builder` has passwordless sudo;
+the subnet NSG alone admits SSH to the Standard public IP; run-command
+installs OpenSSH and its output carries the marker in `value[].message`; a
+deallocated VM publishes as a specialized version through
+`--virtual-machine`, and a VM from it boots with SSH and the same
+`builder`; `az vm restart` gives a new boot ID; a missing group answers exit
+3 `ResourceGroupNotFound`, a missing gallery item exit 3 `ResourceNotFound`,
+an unknown subscription or an authorization failure exit 1 (fail closed);
+`az rest --debug` logs `Request URL:`, `Request method: 'PUT'` and
+`Response status:` as the backend parses them; `az tag update --operation
+Merge` works; `az group list --tag image-build` filters on the key alone.
 
-- that `az vm image show --urn ...:latest` resolves `latest` and reports
-  `hyperVGeneration`, and that the az version on the build host accepts
-  `--security-type Standard`, `--nsg ""` and `@file` values;
-- that the Linux admin `builder` gets passwordless sudo on the chosen base;
-- that the subnet NSG alone admits SSH to the Standard public IP;
-- that `RunPowerShellScript` installs OpenSSH and that run-command output
-  carries the marker as the fake assumes (`value[].message`);
-- that a deallocated VM publishes as a specialized version through
-  `--virtual-machine` into a definition the build created, in the gallery's
-  location, and that a VM from that version boots with SSH and the same
-  `builder`;
-- that `az vm restart` gives a new boot ID the core sees;
-- that a missing resource makes `az ... show` exit 3 with exactly the codes
-  listed above (`ResourceGroupNotFound`; `ResourceNotFound`,
-  `GalleryImageNotFound` or `GalleryImageVersionNotFound`), while a
-  subscription, authorization or tenant failure does not (it must fail the
-  build, not read as "absent"); a missing resource reported any other way
-  fails closed, so the build stops rather than proceeding;
-- that the resource-group PUT through `az rest` returns `201` for a new
-  group and honours `If-None-Match: *` with `412` for an existing one, that
-  `az rest --debug` logs `Request URL: '<url>'`, `Request method: 'PUT'`
-  and then `Response status: <code>` for that request, as the backend
-  parses it,
-  and that `az tag update --operation Merge --subscription` is accepted;
-- that `az group list --tag image-build` filters on the key alone, and the
-  tab-separated output of a group with a missing tag;
+**Open questions:**
+
+- a Windows image built and booted end to end on Azure (the live Windows
+  builds reached verify; none was kept), including what a clone's
+  Administrator password and hostname are;
+- the fixes found live, as this branch carries them, re-checked live;
 - marketplace images that need plan terms accepted: not handled;
-- Trusted Launch: VMs are created `Standard`, and definitions carry no
-  security feature; a subscription that forbids Standard VMs would need both
-  changed.
+- Trusted Launch: VMs are created `Standard` and definitions with
+  `SecurityType=Standard`; a subscription that forbids Standard VMs would
+  need both changed.
 
 ## Dry run and reaping
 

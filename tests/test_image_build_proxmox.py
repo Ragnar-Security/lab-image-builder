@@ -418,10 +418,10 @@ def test_proxmox_resolve_base_newest(tmp_path):
 
     # The SHA sorts the other way; the timestamp decides.
     guests = _cluster(**{
-        "8110": _guest("pve", "enpm634-docker-host-ffff000-202611010000", template=1),
-        "8111": _guest("pve", "enpm634-docker-host-0000aaa-202611080000", template=1),
+        "8110": _guest("pve", "docker-host-ffff000-202611010000", template=1),
+        "8111": _guest("pve", "docker-host-0000aaa-202611080000", template=1),
     })
-    env, recipe = _pve_env(tmp_path / "sha", guests, BASE_PROXMOX="enpm634-docker-host-*")
+    env, recipe = _pve_env(tmp_path / "sha", guests, BASE_PROXMOX="docker-host-*")
     result = _build(env, recipe, "proxmox")
     assert result.returncode == 0, result.stderr
     assert _clones(tmp_path / "sha")[0].startswith("qm clone 8111 8000 "), _clones(tmp_path / "sha")
@@ -450,6 +450,18 @@ def test_proxmox_disk_gb_equal_to_base_passes(tmp_path):
     result = _build(env, recipe, "proxmox")
     assert result.returncode == 0, result.stderr
     assert len(_clones(tmp_path / "t")) == 1
+
+    # The cloud backends' disk overrides do not apply: DISK_GB still must
+    # equal the base, and a cloud override cannot satisfy or break that.
+    env, recipe = _pve_env(tmp_path / "overrides", _cluster(), AWS_DISK_GB="64", GCP_DISK_GB="50",
+                           AZURE_DISK_GB="127")
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 0, result.stderr
+    env, recipe = _pve_env(tmp_path / "override-only", _cluster(), DISK_GB="40", GCP_DISK_GB="20",
+                           AZURE_DISK_GB="20", AWS_DISK_GB="20")
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 1
+    assert f"DISK_GB is 40G but base template {BASE_VMID} has a 20G disk" in result.stderr, result.stderr
 
 
 def test_proxmox_disk_gb_differing_from_base_refused(tmp_path):
@@ -585,7 +597,7 @@ def test_proxmox_leftovers_only_tagged_expired(tmp_path):
     guests = _cluster(**{
         "8003": _guest("pve", "expired", status="running", description=EXPIRED),
         "8004": _guest("pve", "unexpired", status="running", description=UNEXPIRED),
-        "8005": _guest("pve", "untagged", description="image=enpm634-old-abc1234-202601010000"),
+        "8005": _guest("pve", "untagged", description="image=example-old-abc1234-202601010000"),
         "8006": _guest("pve", "template", template=1, description=EXPIRED),
     })
     env, _recipe = _pve_env(tmp_path, guests)
@@ -645,18 +657,25 @@ HAND_TAGGED = {
     "8008": "image-build=ib-202601010000-ABCD image-build-expires=202601010400",
     "8009": "image-build=ib-2026010100-abcd image-build-expires=202601010400",
     "8010": EXPIRED + " image-build=ib-202601010000-ffff",
+    # Run IDs carry 4 hex (builds before 2026-11-14) or 16; no other width.
+    "8011": "image-build=ib-202601010000-abcdabcd image-build-expires=202601010400",
+    "8012": "image-build=ib-202601010000-abcdabcdabcdabcdabcd image-build-expires=202601010400",
 }
+# A current-format run ID (16 hex), expired.
+EXPIRED_16 = "image-build=ib-202601010000-0123456789abcdef image-build-expires=202601010400"
 
 
 def test_proxmox_reap_requires_run_id_format(tmp_path):
     guests = _cluster(**{v: _guest("pve", "hand", status="running", description=d)
                          for v, d in HAND_TAGGED.items()})
     guests["8003"] = _guest("pve", "expired", status="running", description=EXPIRED)
+    guests["8004"] = _guest("pve", "expired16", status="running", description=EXPIRED_16)
     env, _recipe = _pve_env(tmp_path, guests)
     result = _build(env, "--reap", "proxmox")
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["destroyed 8003"], result.stdout
-    assert _destroys(tmp_path) == ["qm stop 8003", "qm destroy 8003 --purge 1"]
+    assert result.stdout.splitlines() == ["destroyed 8003", "destroyed 8004"], result.stdout
+    assert _destroys(tmp_path) == ["qm stop 8003", "qm destroy 8003 --purge 1",
+                                   "qm stop 8004", "qm destroy 8004 --purge 1"]
     assert set(HAND_TAGGED) <= set(_state(tmp_path))
 
     # The node-side check alone: the tag turns into a hand-made one between
@@ -677,7 +696,7 @@ def test_proxmox_clone_tagged_so_failed_set_is_destroyed(tmp_path):
     assert result.returncode == 1
     clone = shlex.split(_clones(tmp_path)[0])
     desc = clone[clone.index("--description") + 1]
-    assert re.fullmatch(r"image-build=ib-\d{12}-[0-9a-f]{4} image-build-expires=\d{12}", desc), desc
+    assert re.fullmatch(r"image-build=ib-\d{12}-[0-9a-f]{16} image-build-expires=\d{12}", desc), desc
     assert _destroys(tmp_path) == ["qm stop 8000", "qm destroy 8000 --purge 1"]
     assert "8000" not in _state(tmp_path)
 
@@ -690,7 +709,7 @@ def test_proxmox_start_tags_and_configures(tmp_path):
     clone = shlex.split(_clones(tmp_path)[0])
     assert clone[:4] == ["qm", "clone", str(BASE_VMID), "8000"], clone
     opts = dict(zip(clone[4::2], clone[5::2]))
-    run_id, expires = re.fullmatch(r"image-build=(ib-\d{12}-[0-9a-f]{4}) image-build-expires=(\d{12})",
+    run_id, expires = re.fullmatch(r"image-build=(ib-\d{12}-[0-9a-f]{16}) image-build-expires=(\d{12})",
                                    opts["--description"]).groups()
     assert opts == {"--name": run_id, "--full": "1", "--storage": "build-store",
                     "--description": f"image-build={run_id} image-build-expires={expires}"}

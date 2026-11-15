@@ -20,7 +20,7 @@ ZONE = "us-east1-b"
 SUBNET = "build-subnet-fake"
 NAT_IP = "192.0.2.20"
 PUBKEY = "ssh-ed25519 AAAAC3FAKEPUBLIC image-build"
-RUN_ID_RE = re.compile(r"^ib-[0-9]{12}-[0-9a-f]{4}$")
+RUN_ID_RE = re.compile(r"^ib-[0-9]{12}-[0-9a-f]{16}$")
 GCP_LABEL_RE = re.compile(r"^[a-z0-9_-]{1,63}$")
 GCP_NAME_RE = re.compile(r"^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$")
 EXPIRED = "202601010000"
@@ -400,17 +400,40 @@ def test_gcp_save_stops_before_image(tmp_path):
     assert gcloud[stop] == f"gcloud compute instances stop {run_id} --project {PROJECT} --zone {ZONE} --quiet"
     create = gcloud[image]
     image_name = create.split()[4]
-    assert image_name.startswith("enpm634-privesc-linux-abc1234-")
+    assert image_name.startswith("example-lab-linux-abc1234-")
     for arg in (f"--project {PROJECT}", f"--source-disk {run_id}", f"--source-disk-zone {ZONE}",
-                "--family enpm634-privesc-linux", "--quiet",
+                "--family example-lab-linux", "--quiet",
                 "--labels image-build-recipe=labs_demo_recipe_env,image-build-commit=abc1234"):
         assert f" {arg}" in create, (arg, create)
     assert "lab-playground-site" not in create
-    assert _state(tmp_path)["images"] == {image_name: {"family": "enpm634-privesc-linux"}}
+    assert _state(tmp_path)["images"] == {image_name: {"family": "example-lab-linux"}}
 
-    env, recipe = _gcp_env(tmp_path / "family", GCP_IMAGE_FAMILY="privesc-linux")
+    env, recipe = _gcp_env(tmp_path / "family", GCP_IMAGE_FAMILY="example-family")
     assert _build(env, recipe, "gcp").returncode == 0
-    assert " --family privesc-linux " in _calls(tmp_path / "family")
+    assert " --family example-family " in _calls(tmp_path / "family")
+
+
+def test_gcp_disk_gb_override(tmp_path):
+    # GCP_DISK_GB sizes the boot disk (windows-cloud images are 50 GB); the
+    # other backends' overrides are ignored here.
+    env, recipe = _gcp_env(tmp_path / "set", "windows", DISK_GB="40", GCP_DISK_GB="50",
+                           AWS_DISK_GB="64", AZURE_DISK_GB="127")
+    result = _build(env, recipe, "gcp")
+    assert result.returncode == 0, result.stderr
+    create = _create_call(_calls(tmp_path / "set"))
+    assert " --boot-disk-size 50GB " in create, create
+    assert result.stdout.endswith("machine_type: e2-small, disk_gb: 50}\n"), result.stdout
+    # Unset: DISK_GB.
+    env, recipe = _gcp_env(tmp_path / "unset", AWS_DISK_GB="64")
+    result = _build(env, recipe, "gcp")
+    assert result.returncode == 0, result.stderr
+    assert " --boot-disk-size 20GB " in _create_call(_calls(tmp_path / "unset"))
+    assert result.stdout.endswith("disk_gb: 20}\n")
+    # A dry run shows the override.
+    env, recipe = _gcp_env(tmp_path / "dry", GCP_DISK_GB="50")
+    result = _build(env, "--dry-run", recipe, "gcp")
+    assert result.returncode == 0, result.stderr
+    assert " --boot-disk-size 50GB " in result.stderr and result.stdout.endswith("disk_gb: 50}\n")
 
 
 def test_gcp_dry_run_runs_no_gcloud(tmp_path):
@@ -421,11 +444,11 @@ def test_gcp_dry_run_runs_no_gcloud(tmp_path):
     for printed in ("DRY-RUN: gcloud compute images describe-from-family ubuntu-2404-lts-amd64 ",
                     "DRY-RUN: gcloud compute instances create ib-",
                     "DRY-RUN: gcloud compute instances stop ib-",
-                    "DRY-RUN: gcloud compute images create enpm634-privesc-linux-abc1234-",
+                    "DRY-RUN: gcloud compute images create example-lab-linux-abc1234-",
                     "DRY-RUN: gcloud compute instances delete ib-"):
         assert printed in result.stderr, printed
     last = result.stdout.rstrip("\n").splitlines()[-1]
-    assert re.fullmatch(rf"gcp: \{{image: projects/{PROJECT}/global/images/enpm634-privesc-linux-abc1234-"
+    assert re.fullmatch(rf"gcp: \{{image: projects/{PROJECT}/global/images/example-lab-linux-abc1234-"
                         r"[0-9]{12}, machine_type: e2-small, disk_gb: 20\}", last), last
     assert KEY_MATERIAL not in result.stderr + result.stdout
 

@@ -1,10 +1,10 @@
 # Image builder
 
-`build_image.sh` builds a VM image from a recipe on one backend: Proxmox, AWS
-or GCP. It is plain bash plus each platform's own CLI. There is no Packer,
-Vagrant, Ansible or Terraform, and no disk conversion (no `import-image`, no
-Google image import). Each backend builds from its own base, so one recipe
-yields one native image per platform.
+`build_image.sh` builds a VM image from a recipe on one backend: Proxmox, AWS,
+GCP or Azure. It is plain bash plus each platform's own CLI. There is no
+Packer, Vagrant, Ansible or Terraform, and no disk conversion (no
+`import-image`, no Google image import). Each backend builds from its own
+base, so one recipe yields one native image per platform.
 
 This directory is in a public repo. It holds no hosts, account or project IDs,
 image IDs or keys. Those go in `config.env`, which is untracked.
@@ -16,7 +16,7 @@ build_image.sh [--dry-run] [--allow-dirty] <recipe.env> <backend>
 build_image.sh --reap <backend> [--dry-run]
 ```
 
-`<backend>` is `proxmox`, `aws` or `gcp`. A build runs these steps in order:
+`<backend>` is `proxmox`, `aws`, `gcp` or `azure`. A build runs these steps in order:
 
 1. Read the recipe and the config, and check them. Name the image.
 2. Resolve the base image or template for the backend.
@@ -49,8 +49,8 @@ reaped). Everything else, including every `DRY-RUN:` line, goes to stderr.
 | Exit | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | A build or reap failed while running. This includes errors a backend raises after the config passed: a malformed `BASE_AWS` or `BASE_GCP`, no image matching the base, a malformed `AWS_INSTANCE_TYPE`, a bad public key, a VMID outside the Proxmox block, a failed setup, verify or seal, no SSH (or no new boot after a reboot) within `IMAGE_BUILD_SSH_WAIT_SECONDS`, a destroy that was refused. Once the build has begun (base resolution onwards), every failure is 1, even one where a backend or a tool it ran exited 2. |
-| 2 | The core rejected the input before any VM started: bad usage or option, unknown backend, unreadable recipe, a missing or invalid recipe key (`OS_FAMILY`, `KEEP_SSH`, the integer keys, `PAYLOAD_DIR`, `SETUP`/`VERIFY`), a missing `BASE_<BACKEND>` key, a recipe outside a git repo, a dirty repo, an invalid `IMAGE_BUILD_TTL_MINUTES` or `IMAGE_BUILD_SSH_WAIT_SECONDS`, an invalid image name, a config that sets a recipe key, or a config the backend's `backend_check_config` rejects. |
+| 1 | A build or reap failed while running. This includes errors a backend raises after the config passed: a malformed `BASE_AWS`, `BASE_GCP` or `BASE_AZURE`, no image matching the base, a base of the other OS family (Azure), a malformed `AWS_INSTANCE_TYPE`, a bad public key, a VMID outside the Proxmox block, a failed setup, verify or seal, no SSH (or no new boot after a reboot) within `IMAGE_BUILD_SSH_WAIT_SECONDS`, a destroy that was refused. Once the build has begun (base resolution onwards), every failure is 1, even one where a backend or a tool it ran exited 2. |
+| 2 | The core rejected the input before any VM started: bad usage or option, unknown backend, unreadable recipe, a missing or invalid recipe key (`OS_FAMILY`, `KEEP_SSH`, the integer keys including a set `*_DISK_GB` override, `PAYLOAD_DIR`, `SETUP`/`VERIFY`), a missing `BASE_<BACKEND>` key, a recipe key the backend requires (`AZURE_VM_SIZE` on Azure), a recipe outside a git repo, a dirty repo, an invalid `IMAGE_BUILD_TTL_MINUTES` or `IMAGE_BUILD_SSH_WAIT_SECONDS`, an invalid image name, a config that sets a recipe key, or a config the backend's `backend_check_config` rejects. |
 | 130, 143 | Interrupted (INT) or terminated (TERM); the trap still ran |
 
 ### Image names and the build log
@@ -79,11 +79,12 @@ for your backend. Set `IMAGE_BUILD_CONFIG=/path/to/file` to use another file.
 The backend checks its own keys and names any that are missing or malformed.
 
 The file is sourced in a subshell, and only the keys of the backend you build
-on come back: names starting `PVE_` (Proxmox), `AWS_` or `GCP_`. Anything
-else it sets is ignored, so it cannot change the builder's own state (for
-example `DRY_RUN`). A config that sets a recipe key (`DISK_GB`,
-`AWS_INSTANCE_TYPE`, `GCP_MACHINE_TYPE`, `PVE_CORES`, a `BASE_*` key, ...)
-stops the build with exit 2: only the recipe sets those.
+on come back: names starting `PVE_` (Proxmox), `AWS_`, `GCP_` or `AZ_`
+(Azure). Anything else it sets is ignored, so it cannot change the builder's
+own state (for example `DRY_RUN`). A config that sets a recipe key
+(`DISK_GB`, `AWS_INSTANCE_TYPE`, `GCP_MACHINE_TYPE`, `AZURE_VM_SIZE`,
+`PVE_CORES`, a `BASE_*` key, ...) stops the build with exit 2: only the
+recipe sets those.
 
 | Backend | Key | Meaning |
 |---|---|---|
@@ -101,10 +102,15 @@ stops the build with exit 2: only the recipe sets those.
 | GCP | `GCP_BUILD_PROJECT` | Project ID. |
 | GCP | `GCP_BUILD_ZONE` | Zone, for example `us-east1-b`. |
 | GCP | `GCP_BUILD_SUBNET` | Subnet of the build network, separate from the lab network. |
+| Azure | `AZ_SUBSCRIPTION_ID` | Subscription ID (a GUID). Every call names it; the CLI's default subscription never decides. |
+| Azure | `AZ_BUILD_LOCATION` | Location, for example `eastus`. The build subnet and the gallery must be in it. |
+| Azure | `AZ_BUILD_SUBNET_ID` | Resource ID of the build subnet, `/subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<subnet>`, in `AZ_SUBSCRIPTION_ID`. Its NSG admits `tcp/22` from the build host only. |
+| Azure | `AZ_GALLERY_RG` | Resource group of the Azure Compute Gallery. |
+| Azure | `AZ_GALLERY` | Name of the gallery (letters, digits, `.` and `_`). |
 
 The Proxmox backend needs `python3` on the machine running the build. The AWS
-backend needs the AWS CLI v2 on `PATH`, and the GCP backend `gcloud` (neither
-is checked in a dry run).
+backend needs the AWS CLI v2 on `PATH`, the GCP backend `gcloud`, and the
+Azure backend `az`, logged in (none is checked in a dry run).
 
 `IMAGE_BUILD_TTL_MINUTES` (environment, default 240) sets how long a build's
 resources live before `--reap` may remove them.
@@ -131,22 +137,33 @@ Values arrive exactly as written, spaces, quotes and globs included.
 | `BASE_PROXMOX` | yes | Proxmox: a template name glob. The newest match on `PVE_NODE` is used. |
 | `BASE_AWS` | yes | AWS: `<owner>:<AMI name glob>`. Owner is `self`, `amazon` or an account ID. The newest available AMI wins. |
 | `BASE_GCP` | yes | GCP: `<image project>/<image family>`. |
+| `BASE_AZURE` | Azure only | Azure: a marketplace URN `<publisher>:<offer>:<sku>:<version>` (`latest` resolves to the newest version, which the build log records), or a gallery image-version resource ID `/subscriptions/.../galleries/<gallery>/images/<definition>/versions/<X.Y.Z>`. |
 | `DISK_GB` | yes | Root disk size in GB. On Proxmox it must equal the base template's disk size: the build checks it and stops otherwise (see "Proxmox"). |
 | `AWS_INSTANCE_TYPE` | yes | For example `t3.small`. |
 | `GCP_MACHINE_TYPE` | yes | For example `e2-standard-2`. |
+| `AZURE_VM_SIZE` | Azure only | For example `Standard_B2s`. |
 | `PVE_MEMORY_MB` | yes | Build VM memory on Proxmox. |
 | `PVE_CORES` | yes | Build VM cores on Proxmox. |
+| `AWS_DISK_GB` | no | Root disk size on AWS only, instead of `DISK_GB`. |
+| `GCP_DISK_GB` | no | Boot disk size on GCP only, instead of `DISK_GB`. `windows-cloud/windows-2022` is a 50 GB image, so GCE refuses a smaller disk. |
+| `AZURE_DISK_GB` | no | OS disk size on Azure only, instead of `DISK_GB`. Azure's Windows marketplace images are 127 GB. |
 | `SETUP_PASSES` | no | How many times to run `SETUP` (default 1). |
 | `KEEP_SSH` | no | `yes` or `no` (default `no`). See "Host SSH". |
 | `GCP_IMAGE_FAMILY` | no | Family the new GCP image joins (default `IMAGE_PREFIX`). |
 | `PAYLOAD_EXCLUDE` | no | Space-separated `tar --exclude` globs applied to the payload. |
 
-All of the required keys must be set for every backend, even one you are not
-building on; the unused keys are just not read. The recipe must set the
-`BASE_*` key of the backend you name, or the build stops with exit 2.
+All of the keys marked "yes" must be set for every backend, even one you are
+not building on; the unused keys are just not read. The recipe must set the
+`BASE_*` key of the backend you name, or the build stops with exit 2; so must
+a recipe built on Azure set `AZURE_VM_SIZE`, which no other backend needs.
+The `*_DISK_GB` overrides exist because one disk size cannot fit every
+platform's base: Proxmox requires `DISK_GB` to equal its template
+(`base-ws2022` is 40 GB) while GCP and Azure refuse a disk smaller than their
+image. Proxmox ignores all three.
 `SETUP` and `VERIFY` may use only letters, digits, space and `._+-/`, with no
 `..` component, and the files must exist. `SETUP_PASSES`, `DISK_GB`,
-`PVE_MEMORY_MB` and `PVE_CORES` must be positive integers.
+`PVE_MEMORY_MB`, `PVE_CORES` and any `*_DISK_GB` that is set must be positive
+integers.
 
 The payload is uploaded to `/tmp/image-build` on Linux and `C:\image-build` on
 Windows. Setup and verify run as root (Linux, through `sudo`) or in PowerShell
@@ -157,7 +174,8 @@ Windows. Setup and verify run as root (Linux, through `sudo`) or in PowerShell
 - **Never reboot from a setup script. Exit 100 instead.** Exit 0 means done.
   Exit 100 means done, but the VM needs a reboot: the core reboots it
   (`sudo systemctl reboot` on Linux, `Restart-Computer -Force` on Windows,
-  started in the background so the SSH call returns), then waits until SSH
+  started in the background so the SSH call returns; on Azure the backend's
+  `backend_reboot` runs `az vm restart` instead), then waits until SSH
   answers with a boot ID other than the one it recorded before the setup ran
   (Linux `/proc/sys/kernel/random/boot_id`; Windows the last boot time, UTC,
   to the second). Only then does the next pass or verify run, so nothing runs
@@ -212,7 +230,11 @@ is passed (which the core does for `KEEP_SSH=yes`).
 
 ## Windows recipes
 
-- On AWS, set `DISK_GB` to at least 30.
+- Windows images differ in size per platform, so set the disk per backend:
+  `DISK_GB=40` for Proxmox (`base-ws2022`), `GCP_DISK_GB=50`
+  (`windows-cloud/windows-2022`), `AZURE_DISK_GB=127` (the Windows Server
+  marketplace images); on AWS the root disk must be at least 30
+  (`AWS_DISK_GB` if `DISK_GB` is smaller).
 - `seal_windows.ps1` deletes `C:\image-build` and
   `C:\ProgramData\ssh\administrators_authorized_keys`, then sets the local
   `Administrator` password to a random 32-character value generated in the
@@ -231,7 +253,8 @@ is passed (which the core does for `KEEP_SSH=yes`).
   (`ipconfig /release` would cut it). The seal exits 1 if a lease is still
   cached.
 - **Sysprep is not run.** Whether and how to run it is to be decided per cloud
-  during the first Windows build.
+  during the first Windows build. On Azure the image is therefore published
+  as a *specialized* gallery image (see "Azure").
 - The seal does not touch the firewall. The `tcp/22` allow rule that the build
   created stays enabled, even when `sshd` is disabled.
 - A Windows command given to the core's remote runner may not contain a double
@@ -255,6 +278,13 @@ functions. The full text is in the header of `build_image.sh`.
 | `backend_destroy_id <id>` | Re-check the tag through `query`, then destroy through `mutate`. |
 | `backend_templates_yaml <image_id>` | Print the `templates.yaml` lines. |
 
+Two optional parts, used by Azure only so far:
+
+| Optional | Job |
+|---|---|
+| `BACKEND_RECIPE_KEYS` | Space-separated recipe keys (each one of the core's optional keys) this backend requires. A build whose recipe lacks one stops with exit 2. Azure sets `AZURE_VM_SIZE`. |
+| `backend_reboot` | Reboot the build VM when a setup pass exits 100, instead of the core's in-guest reboot command. The core then waits for a new boot ID over SSH as always. |
+
 Every function runs with `errexit` in force. A step that may fail must be
 guarded inside the backend. Backends reach a platform only through two
 helpers: `mutate` for anything that creates, changes or deletes, and `query`
@@ -266,10 +296,11 @@ Every build resource carries two tags (labels on GCP):
 
 | Key | Value |
 |---|---|
-| `image-build` | The run ID, `ib-<yyyymmddhhmm>-<4 hex>` |
+| `image-build` | The run ID, `ib-<yyyymmddhhmm>-<16 hex>` (64 random bits; builds started before 2026-11-14 used 4 hex, which the Proxmox, AWS and GCP reaps still accept) |
 | `image-build-expires` | UTC `yyyymmddhhmm`, `IMAGE_BUILD_TTL_MINUTES` after the build started (default 4 hours) |
 
-On Proxmox both go in the VM description, as two space-separated words. What
+On Proxmox both go in the VM description, as two space-separated words. On
+Azure they go on the build's own resource group (and on the VM in it). What
 the saved image carries depends on the backend:
 
 | Backend | The saved image carries |
@@ -277,6 +308,7 @@ the saved image carries depends on the backend:
 | Proxmox | The description is replaced by `image=<image-name>` and nothing else: no build tags, no recipe or commit tag. The replica copy has the same description. |
 | AWS | The AMI and its snapshots carry `image-build-recipe` and `image-build-commit` tags. |
 | GCP | The image carries `image-build-recipe` and `image-build-commit` labels, and a description naming the recipe, commit and run ID. |
+| Azure | The gallery image version carries `image-build-recipe` and `image-build-commit` tags. |
 
 The image has no expiry tag, because the product does not expire.
 
@@ -306,21 +338,39 @@ before the delete.
   was recorded, the cleanup lists the instances in `AWS_BUILD_REGION` tagged
   `image-build=<RUN_ID>` (pending, running, stopping or stopped) and
   terminates each through the same check, so another run's instance is never
-  touched.
+  touched. On Azure the unit is the build's resource group, and the build
+  owns it only if Azure answered its group PUT with `201 Created` (see
+  "Azure"); the cleanup deletes it only while its name, `image-build`,
+  `image-build-expires`, `image-build-owner` and `image-build-creating` all
+  still match this run (the last two must both be the run's 128-bit nonce).
 - **`--reap`** requires all of these:
-  - the `image-build` value matches `ib-<12 digits>-<4 hex>` exactly;
+  - the `image-build` value matches `ib-<12 digits>-<16 hex>` (or the older
+    `<4 hex>`; Azure accepts 16 only) exactly;
   - the resource has one `image-build` tag (AWS tags and GCP labels hold one
     value per key; on Proxmox the description may hold only one
     `image-build=` word);
   - `image-build-expires` is 12 digits and earlier than now (UTC);
   - on GCP, the label also equals the instance's own name;
+  - on Azure, the resource is a resource group whose name equals the tag,
+    whose `image-build-owner` and `image-build-creating` are one and the same
+    32-hex nonce (the creation token, below), and whose `image-build-expires`
+    is a real UTC calendar minute (`000000000000`, `202613010000` and
+    `202602300000` are refused, not read as long expired);
   - on Proxmox, also: the VM is on `PVE_NODE`, its VMID is in `8000`-`8999`,
     and it is not a template.
 
-A resource that has the tag but fails these checks is never deleted. On AWS,
-one whose `image-build-expires` is missing or malformed is reported and left
-out of the list. One that is listed but whose tag is not a run ID is refused
-at the delete, and `--reap` reports it and exits 1.
+A resource that has the tag but fails these checks is never deleted. On AWS
+and Azure, one whose `image-build-expires` is missing or malformed is reported
+and left out of the list (on Azure, so is one without a valid nonce). One that
+is listed but whose tag is not a run ID is refused at the delete, and
+`--reap` reports it and exits 1. On Azure, a read counts as "the group does
+not exist" only when `az` exits 3 with exactly `ResourceGroupNotFound`;
+`SubscriptionNotFound`, an authorization or tenant error, an unknown code or
+an empty successful answer fails the destroy instead.
+
+**Deleting an Azure resource group deletes everything in it.** The builder
+only ever deletes a group it tagged with its own run ID, whose name is that
+run ID; never put anything else in an `ib-...` group.
 
 ## Backends
 
@@ -580,7 +630,7 @@ then copy it to the replica node with `sync_template.sh`.
 
 The build runs one instance from the newest available AMI matching `BASE_AWS`,
 in `AWS_BUILD_SUBNET_ID`, with a public IPv4 address, IMDSv2 required, and a
-`DISK_GB` gp3 root volume that is deleted on termination. The key goes in as
+`DISK_GB` (or `AWS_DISK_GB`) gp3 root volume that is deleted on termination. The key goes in as
 user data: on Linux, cloud-init creates `builder` with passwordless sudo and the
 key; on Windows, EC2Launch runs a script that installs OpenSSH Server, writes
 `administrators_authorized_keys`, starts `sshd` and opens `tcp/22`. The image
@@ -608,7 +658,197 @@ labels are on the instance; the image carries `image-build-recipe` and
 **`--reap gcp` scans all zones of the project**, not only `GCP_BUILD_ZONE`. See
 "What a destroy or a reap will delete" for the criteria. IDs are printed as
 `<zone>/<instance>`.
-`templates.yaml` gets `gcp: {image, machine_type, disk_gb}`.
+`templates.yaml` gets `gcp: {image, machine_type, disk_gb}`. The boot disk is
+`GCP_DISK_GB` when set, else `DISK_GB`.
+
+### Azure
+
+**Tested against a fake `az`, and run live once** (2026-11-15, `eastus`,
+`az` 2.92.0): Linux builds, the reboot protocol, a failed verify, a killed
+build plus `--reap`, and a build from a specialized gallery base all passed
+with the fixes that run found (below). No Windows image has been produced on
+Azure yet; see "Open questions" below before relying on one.
+
+Each build gets its own resource group, named after the run ID
+(`ib-<yyyymmddhhmm>-<16 hex>`), in `AZ_BUILD_LOCATION` and tagged
+`image-build`, `image-build-expires`, `image-build-owner` and
+`image-build-creating`; the last two hold the same 128-bit nonce made for
+the run.
+
+**There is no create-only primitive for a resource group.** `az group
+create` is a create-or-update, and Azure ignores `If-None-Match: *` (and
+`If-Match`) on a resource-group PUT: a PUT on an existing group answers
+`200` and replaces all its tags (seen live; a resource group has no etag).
+So the backend:
+
+1. Reads the group first, fail-closed: only `az` exit 3 with exactly
+   `ResourceGroupNotFound` lets the build go on. A group that exists is
+   refused and left unchanged; any other error stops the build.
+2. Sends `az rest --method put` on the group's URI with `--debug` (and still
+   `If-None-Match: *`, in case Azure ever honours it), reads the HTTP status
+   from the debug log (kept in the run's temp directory and deleted at once:
+   it holds a prefix of the access token), and owns the group only on
+   `201 Created`. The status counts only if it is the one `Response status:`
+   line that follows a `Request URL:` line naming exactly this group's URI
+   with method `PUT`; a status from any other request (a token fetch, say)
+   is ignored, and none or more than one such line reads as unknown.
+
+**The residual race** is a group created under the same name between the
+read and the PUT, a second or two. The name carries 64 random bits and is
+not published before the PUT, so that takes a 2⁻⁶⁴ coincidence, or someone
+who can read the build host and already holds `resourceGroups/write` in the
+subscription (and could retag anything anyway). If it happens, that group's
+tags are replaced by the creation token, the PUT answers `200`, and the
+build stops: the group is never owned, deleted or reaped; its other tags
+are lost, its resources untouched.
+
+**The PUT is non-reapable by construction.** Its only tag is the creation
+token `image-build-creating=<nonce>`: no `image-build`, no expiry, no owner
+tag, so nothing it leaves behind can ever be listed or deleted by `--reap`,
+whatever Azure or `az` did. No outcome needs a second, compensating write to
+be safe.
+
+**The creation token proves continuity.** A `201` proves the group was
+created, not that it is still the same group a moment later: Azure group IDs
+are names, so a group deleted and recreated under the same name before the
+tag Merge would receive the Merge, owner nonce included. Only this run's PUT
+ever writes the token, and the Merge leaves it in place, so ownership, the
+cleanup and the reap all require `image-build-creating == image-build-owner
+== nonce`. A replacement that received only the Merge lacks the token and is
+never owned, deleted or reaped.
+
+| PUT answer | Result |
+|---|---|
+| `201` | Created by this run. Only now does the build merge on `image-build`, `image-build-expires` and `image-build-owner` (`az tag update --operation Merge`), read all four tags back, and, if they are exactly this run's with the creation token intact, own the group (deleted at the end). If the tag write fails or the read-back does not show this run's four tags, **nothing is deleted**: a parsed `201` is history (the group could have been replaced since, or the status misread), so the build stops and names the group with the `az group delete` command for a hand cleanup. An empty resource group costs nothing; a group without both nonces is invisible to `--reap`. |
+| `200` | The race above: an existing group's tags were replaced with `image-build-creating`. Nothing owned, written again or deleted; the build stops and names the group; check it by hand. |
+| `412` | Not seen live (Azure ignores the header); kept as a defence. The group exists; nothing was changed; the build stops. |
+| Another error, or no readable status | Nothing owned, written again or deleted; the build stops and names the group. A group Azure created while `az` reported an error is empty and carries only `image-build-creating`; delete it by hand. |
+
+Every tag read uses a list-of-lists query (`--query '[[a, b]]'`): with
+`-o tsv`, `az` prints a flat list `[a, b]` one value per line, and a list of
+lists as one tab-separated row. A missing tag prints `None`, which the
+backend reads as empty.
+
+The VM (same name) is created in it from `BASE_AZURE`, size `AZURE_VM_SIZE`,
+OS disk `AZURE_DISK_GB` or `DISK_GB`, security type `Standard`, with its NIC
+in `AZ_BUILD_SUBNET_ID`, **no NIC-level NSG** (`--nsg ""`; `az vm create`
+would otherwise open `tcp/22` to the internet) and a Standard static public
+IP in the same group. Every `az` call names `--subscription`, except the
+group PUT, whose URI names it. A static public IP is kept across
+`az vm restart`.
+
+- **Linux:** Azure creates the admin user `builder` with the run's public key
+  (`--ssh-key-values`, a file) and passwordless sudo.
+- **Windows:** Azure injects no SSH key into Windows. The admin user `builder`
+  gets a random password generated on the build host, written to the run's
+  temp directory (mode 600) and passed as `--admin-password @<file>`, so it
+  is never on a command line, printed, logged or kept (the temp directory is
+  deleted on exit). Azure gives that name to the built-in Administrator
+  (RID 500): there is no separate `builder` account, and no account called
+  `Administrator`. Then `az vm run-command invoke --command-id
+  RunPowerShellScript` runs the GCP backend's OpenSSH script: it installs
+  OpenSSH Server, writes the key to `administrators_authorized_keys`, finds
+  the RID-500 account by its SID, renames it back to `Administrator` (the
+  seal and the payloads use that name) and gives it a fresh random password
+  generated in the guest and never output, starts `sshd` and opens
+  `tcp/22`. The build logs in as `Administrator`. Azure Windows images
+  therefore contain no `builder` account.
+- **run-command reports success even when the script failed**, so each
+  script prints `image-build-ssh-ready` as its last step and the build fails
+  without it.
+- **A specialized gallery base** (an image this backend built, with
+  `KEEP_SSH=yes`) is created with `--specialized`. `az` 2.92 still demands
+  a credential then (an SSH key, or a password on Windows) and leaves it out
+  of the VM, so the build passes the run's key or generated password anyway,
+  and run-command writes the key: `RunShellScript` into `builder`'s
+  `authorized_keys` on Linux, the same OpenSSH script on Windows. Such a
+  base must have been built with `KEEP_SSH=yes`, or `sshd` is off.
+
+A setup that exits 100 is rebooted with `az vm restart`. **Save:** the
+backend refuses an existing version of the same name (it never overwrites),
+checks the image definition `IMAGE_PREFIX` in the gallery (it must be
+`Specialized`, of the recipe's OS type and the base's Hyper-V generation) or
+creates it (`--publisher image-build --offer <IMAGE_PREFIX> --sku
+<IMAGE_PREFIX> --features SecurityType=Standard`: without it `az` 2.92
+marks a V2 definition `TrustedLaunchSupported`), **deallocates the VM**, then publishes a **specialized**
+image version from it (`az sig image-version create --virtual-machine`): no
+generalize, no sysprep, as on AWS and Proxmox. The version is
+`<yyyy>.<mmdd>.<hhmm>` of the build timestamp as integers (a build at
+`202611140905` is `2026.1114.905`), because a gallery version must be three
+integers; two builds of one prefix in the same minute collide, and the
+second is refused. It carries `image-build-recipe` and `image-build-commit`
+tags. `IMAGE_ID` is the version's resource ID. A version whose create failed
+or did not reach `Succeeded` is left in place and not logged, and the error
+prints the `az sig image-version delete` command for it. The two existence
+reads before the save fail closed: a version or definition counts as absent
+only when `az` exits 3 with exactly `ResourceNotFound` (the only code `az`
+2.92 returns for a missing gallery, definition or version); any other error,
+and a successful answer that is empty or malformed (a version ID that is
+not this version's, a definition without a valid OS type, state and
+generation), stops the build before the VM is deallocated. Publishing a
+version takes about 8 to 10 minutes of a 12-minute Linux build.
+
+**What a sealed Azure image keeps.**
+
+- **The Azure VM agent** (`walinuxagent` on Linux, the guest agent on
+  Windows) stays installed and running. Anyone with
+  `Microsoft.Compute/virtualMachines/runCommand/action` on a VM made from
+  the image runs code in it as root or SYSTEM. This is the same class as
+  the SSM agent on AWS and the guest agent on GCP: decide whether the
+  portal's Azure identity ever holds that right on lab VMs.
+- **The build VM's hostname.** A specialized image is never re-provisioned,
+  so every clone keeps it (`ib-<yyyymmddhhmm>-<16 hex>` on Linux, the
+  15-character `ib-<ddhhmm>-<4 hex>` computer name on Windows).
+
+`--reap azure` lists the subscription's resource groups that carry an
+`image-build` tag. IDs are group names. `templates.yaml` gets
+`azure: {image, vm_size, disk_gb}`.
+
+**One-time setup** (by an operator, once per subscription):
+
+1. A resource group for the gallery, and an Azure Compute Gallery in it, both
+   in `AZ_BUILD_LOCATION`: `az group create`, then `az sig create
+   --resource-group <AZ_GALLERY_RG> --gallery-name <AZ_GALLERY>`.
+2. A build VNet and subnet in `AZ_BUILD_LOCATION`, separate from any lab
+   network, with an NSG on the subnet whose only inbound allow beyond the
+   defaults is `tcp/22` from the build host's public address. The subnet
+   needs outbound internet (setup installs packages).
+3. The build identity's RBAC: **Contributor on `AZ_GALLERY_RG`** (definitions
+   and versions); on the subscription, the right to create resource groups
+   and to manage what is in them (Contributor on the subscription is the
+   simple form; a custom role with `Microsoft.Resources/subscriptions/
+   resourceGroups/write|read|delete` plus compute and network write on
+   `ib-*` groups is tighter, and an Azure Policy can require the
+   `image-build` tag on every group that role creates); and **`Microsoft.
+   Network/virtualNetworks/subnets/join/action`** on the build subnet
+   (Network Contributor on the subnet, or a custom role with that action).
+4. `az login` (or a service principal) on the build host, and the
+   subscription ID in `config.env`.
+
+**What the live run proved** (2026-11-15): `latest` resolves and the base's
+Hyper-V generation reads correctly; `az` accepts `--security-type Standard`,
+`--nsg ""` and `@file` values; the Linux `builder` has passwordless sudo;
+the subnet NSG alone admits SSH to the Standard public IP; run-command
+installs OpenSSH and its output carries the marker in `value[].message`; a
+deallocated VM publishes as a specialized version through
+`--virtual-machine`, and a VM from it boots with SSH and the same
+`builder`; `az vm restart` gives a new boot ID; a missing group answers exit
+3 `ResourceGroupNotFound`, a missing gallery item exit 3 `ResourceNotFound`,
+an unknown subscription or an authorization failure exit 1 (fail closed);
+`az rest --debug` logs `Request URL:`, `Request method: 'PUT'` and
+`Response status:` as the backend parses them; `az tag update --operation
+Merge` works; `az group list --tag image-build` filters on the key alone.
+
+**Open questions:**
+
+- a Windows image built and booted end to end on Azure (the live Windows
+  builds reached verify; none was kept), including what a clone's
+  Administrator password and hostname are;
+- the fixes found live, as this branch carries them, re-checked live;
+- marketplace images that need plan terms accepted: not handled;
+- Trusted Launch: VMs are created `Standard` and definitions with
+  `SecurityType=Standard`; a subscription that forbids Standard VMs would
+  need both changed.
 
 ## Dry run and reaping
 
@@ -668,3 +908,12 @@ aws ec2 delete-snapshot --region <region> --snapshot-id <snap-id>
 ```
 gcloud compute images delete <image-name> --project <project>
 ```
+
+**Azure.** The image ID the build printed is the version's resource ID:
+
+```
+az sig image-version delete --ids <image-version-id>
+```
+
+The image definition stays; delete it with `az sig image-definition delete`
+once it holds no version.

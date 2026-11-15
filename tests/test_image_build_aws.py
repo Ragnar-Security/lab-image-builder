@@ -41,7 +41,7 @@ BASE_AMI = "ami-0123456789abcdef0"
 NEW_AMI = "ami-0fedcba9876543210"
 INSTANCE = "i-0123456789abcdef0"
 PUBKEY = "ssh-ed25519 AAAAC3FAKEPUBLIC image-build"  # what the core's fake ssh-keygen writes
-RUN_ID_RE = re.compile(r"^ib-\d{12}-[0-9a-f]{4}$")
+RUN_ID_RE = re.compile(r"^ib-\d{12}-[0-9a-f]{16}$")
 
 # --- the fake aws ------------------------------------------------------------------
 
@@ -260,7 +260,7 @@ def _tags(specs: list, resource: str) -> dict:
 
 
 def _run_id(stderr: str) -> str:
-    m = re.search(r"run (ib-\d{12}-[0-9a-f]{4}):", stderr)
+    m = re.search(r"run (ib-\d{12}-[0-9a-f]{16}):", stderr)
     assert m, stderr
     return m.group(1)
 
@@ -327,7 +327,7 @@ def test_aws_order_save_and_templates(tmp_path):
     image = _only(tmp_path, "create-image")["opts"]
     assert image["--instance-id"] == [INSTANCE]
     name = image["--name"][0]
-    assert re.fullmatch(r"enpm634-privesc-linux-abc1234-\d{12}", name)
+    assert re.fullmatch(r"example-lab-linux-abc1234-\d{12}", name)
     specs = json.loads(image["--tag-specifications"][0])
     assert sorted(s["ResourceType"] for s in specs) == ["image", "snapshot"]
     for resource in ("image", "snapshot"):
@@ -373,6 +373,32 @@ def test_aws_windows_user_data_installs_openssh(tmp_path):
     assert json.loads(run["--block-device-mappings"][0])[0]["Ebs"]["VolumeSize"] == 40
     ssh_lines = [line for line in _calls(tmp_path).splitlines() if line.startswith("ssh ")]
     assert ssh_lines and all("Administrator@192.0.2.10" in line for line in ssh_lines)
+
+
+def test_aws_disk_gb_override(tmp_path):
+    # AWS_DISK_GB sizes the AWS root volume; the other backends' overrides
+    # are ignored here.
+    env, recipe = _aws_env(tmp_path / "set", AWS_DISK_GB="64", GCP_DISK_GB="50", AZURE_DISK_GB="127")
+    result = _build(env, recipe, "aws")
+    assert result.returncode == 0, result.stderr
+    run = _only(tmp_path / "set", "run-instances")["opts"]
+    assert json.loads(run["--block-device-mappings"][0])[0]["Ebs"]["VolumeSize"] == 64
+    assert result.stdout == f'aws: {{image_id: "{NEW_AMI}", instance_type: "t3.small", disk_gb: 64}}\n'
+    # Unset: DISK_GB, even when another backend's override is set.
+    env, recipe = _aws_env(tmp_path / "unset", GCP_DISK_GB="50")
+    result = _build(env, recipe, "aws")
+    assert result.returncode == 0, result.stderr
+    run = _only(tmp_path / "unset", "run-instances")["opts"]
+    assert json.loads(run["--block-device-mappings"][0])[0]["Ebs"]["VolumeSize"] == 20
+    assert result.stdout.endswith("disk_gb: 20}\n")
+    # A dry run shows the override, and a malformed one stops the build.
+    env, recipe = _aws_env(tmp_path / "dry", AWS_DISK_GB="64")
+    result = _build(env, "--dry-run", recipe, "aws")
+    assert result.returncode == 0, result.stderr
+    assert '"VolumeSize":64' in result.stderr and result.stdout.endswith("disk_gb: 64}\n")
+    env, recipe = _aws_env(tmp_path / "bad", AWS_DISK_GB="40G")
+    result = _build(env, "--dry-run", recipe, "aws")
+    assert result.returncode == 2 and "AWS_DISK_GB must be a positive integer" in result.stderr
 
 
 def test_aws_resolve_base_none_fails(tmp_path):

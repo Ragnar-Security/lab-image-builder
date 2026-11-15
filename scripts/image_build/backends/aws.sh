@@ -6,7 +6,7 @@
 #   AWS_BUILD_SUBNET_ID  a public subnet of the build VPC (not the lab VPC)
 #   AWS_BUILD_SG_ID      admits SSH from the build host only
 # Recipe: BASE_AWS=<owner>:<AMI name glob> (owner: self, amazon or an account
-# ID), AWS_INSTANCE_TYPE, DISK_GB, OS_FAMILY.
+# ID), AWS_INSTANCE_TYPE, DISK_GB (AWS_DISK_GB overrides it here), OS_FAMILY.
 #
 # Reads go through `query`. Everything that creates, changes or deletes a
 # resource goes through `mutate`, and so do the waiters: they only wait on what
@@ -110,7 +110,7 @@ _aws_terminate() {
       ;;
     expired)
       now="$(date -u +%Y%m%d%H%M)"
-      [[ "$tag" =~ ^ib-[0-9]{12}-[0-9a-f]{4}$ ]] \
+      [[ "$tag" =~ ^ib-[0-9]{12}-[0-9a-f]{4}([0-9a-f]{12})?$ ]] \
         || die "aws: $id carries image-build='$tag', not a build run ID; not terminated"
       [[ "$expires" =~ ^[0-9]{12}$ ]] && [ "$expires" -lt "$now" ] \
         || die "aws: $id has image-build-expires='$expires', not expired (now $now); not terminated"
@@ -192,7 +192,7 @@ backend_start() {
     --image-id "$base" --count 1 --instance-type "$AWS_INSTANCE_TYPE" \
     --subnet-id "$AWS_BUILD_SUBNET_ID" --security-group-ids "$AWS_BUILD_SG_ID" \
     --associate-public-ip-address \
-    --block-device-mappings "[{\"DeviceName\":\"$root\",\"Ebs\":{\"VolumeSize\":$DISK_GB,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
+    --block-device-mappings "[{\"DeviceName\":\"$root\",\"Ebs\":{\"VolumeSize\":${AWS_DISK_GB:-$DISK_GB},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
     --tag-specifications "$specs" \
     --metadata-options HttpTokens=required,HttpEndpoint=enabled \
     --user-data "file://$user_data" \
@@ -303,5 +303,5 @@ backend_destroy_id() {
 }
 
 backend_templates_yaml() {
-  printf 'aws: {image_id: "%s", instance_type: "%s", disk_gb: %s}\n' "$1" "$AWS_INSTANCE_TYPE" "$DISK_GB"
+  printf 'aws: {image_id: "%s", instance_type: "%s", disk_gb: %s}\n' "$1" "$AWS_INSTANCE_TYPE" "${AWS_DISK_GB:-$DISK_GB}"
 }

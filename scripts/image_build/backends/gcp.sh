@@ -6,7 +6,8 @@
 #
 # Config: GCP_BUILD_PROJECT, GCP_BUILD_ZONE, GCP_BUILD_SUBNET.
 # Recipe: BASE_GCP=<image project>/<image family>, GCP_MACHINE_TYPE,
-#         GCP_IMAGE_FAMILY (the family the new image joins; default IMAGE_PREFIX).
+#         GCP_IMAGE_FAMILY (the family the new image joins; default IMAGE_PREFIX),
+#         DISK_GB (GCP_DISK_GB overrides it here: windows-cloud images are 50 GB).
 #
 # The build key goes in from a file, so it never appears on a command line:
 #   Linux    ssh-keys metadata "builder:<key>"; the guest agent creates the
@@ -19,12 +20,13 @@
 #
 # Build VM IDs: backend_leftovers prints <zone>/<instance>, from every zone of
 # the project. A build VM is an instance whose image-build label equals its own
-# name (ib-<yyyymmddhhmm>-<4 hex>) and carries image-build-expires.
+# name (ib-<yyyymmddhhmm>-<16 hex>, or 4 hex from older builds) and carries
+# image-build-expires.
 
 # The config keys this backend reads (the core imports only these).
 BACKEND_CONFIG_PREFIX=GCP_
 
-_GCP_RUN_ID_RE='^ib-[0-9]{12}-[0-9a-f]{4}$'
+_GCP_RUN_ID_RE='^ib-[0-9]{12}-[0-9a-f]{4}([0-9a-f]{12})?$'
 _GCP_NAME_RE='^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$'
 _GCP_ZONE_RE='^[a-z]+-[a-z]+[0-9]+-[a-z]$'
 # One OpenSSH public key line, with no quote (it is embedded in a PowerShell
@@ -143,7 +145,7 @@ backend_start() {
 
   args=(compute instances create "$run_id" --project "$GCP_BUILD_PROJECT" --zone "$GCP_BUILD_ZONE"
         --machine-type "$GCP_MACHINE_TYPE" --subnet "$GCP_BUILD_SUBNET" --image "$base"
-        --boot-disk-size "${DISK_GB}GB" --boot-disk-auto-delete
+        --boot-disk-size "${GCP_DISK_GB:-$DISK_GB}GB" --boot-disk-auto-delete
         --no-service-account --no-scopes
         --labels "image-build=$RUN_ID,image-build-expires=$BUILD_EXPIRES_UTC")
   # The core's per-run temp dir (removed on exit) holds the metadata files.
@@ -258,5 +260,5 @@ backend_destroy_id() {
 }
 
 backend_templates_yaml() {
-  printf 'gcp: {image: %s, machine_type: %s, disk_gb: %s}\n' "$1" "$GCP_MACHINE_TYPE" "$DISK_GB"
+  printf 'gcp: {image: %s, machine_type: %s, disk_gb: %s}\n' "$1" "$GCP_MACHINE_TYPE" "${GCP_DISK_GB:-$DISK_GB}"
 }

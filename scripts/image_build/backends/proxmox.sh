@@ -124,10 +124,11 @@ elif mode == "disksize":
     print("%s\t%s" % (gib.numerator if gib.denominator == 1 else "-", size))
 elif mode == "expired":
     # A reapable VM carries exactly one image-build tag in the core's RUN_ID
-    # format (ib-<yyyymmddhhmm>-<4 hex>), and one expiry in the past.
+    # format (ib-<yyyymmddhhmm>-<16 hex>, or 4 hex from older builds), and one
+    # expiry in the past.
     now, t = int(args[0]), tags(load())
     runs = [x[len("image-build="):] for x in t if x.startswith("image-build=")]
-    tagged = len(runs) == 1 and re.fullmatch(r"ib-[0-9]{12}-[0-9a-f]{4}", runs[0]) is not None
+    tagged = len(runs) == 1 and re.fullmatch(r"ib-[0-9]{12}-[0-9a-f]{4}(?:[0-9a-f]{12})?", runs[0]) is not None
     exp = [x[len("image-build-expires="):] for x in t if x.startswith("image-build-expires=")]
     ok = tagged and len(exp) == 1 and len(exp[0]) == 12 and exp[0].isdigit() and int(exp[0]) < now
     sys.exit(0 if ok else 1)
@@ -375,7 +376,7 @@ backend_start() {
   # shell would read.
   [[ "$key" =~ ^[A-Za-z0-9@.+/=_:-]+(\ [A-Za-z0-9@.+/=_:-]+)*$ ]] \
     || die "proxmox: public key $3 has an unexpected format"
-  [[ "$run_id" =~ ^ib-[0-9]{12}-[0-9a-f]{4}$ ]] || die "proxmox: unexpected run ID '$run_id'"
+  [[ "$run_id" =~ ^ib-[0-9]{12}-[0-9a-f]{4}([0-9a-f]{12})?$ ]] || die "proxmox: unexpected run ID '$run_id'"
   # Recipe values (absent in a reap, so not checked with the config).
   [[ "$PVE_MEMORY_MB" =~ ^[1-9][0-9]{0,8}$ && "$PVE_CORES" =~ ^[1-9][0-9]{0,8}$ ]] \
     || die "proxmox: PVE_MEMORY_MB and PVE_CORES must be positive integers"
@@ -473,7 +474,7 @@ backend_destroy() {
     return 0
   fi
   _pve_guard_vmid "$vmid" "$_PVE_BLOCK_MAX"
-  [[ "$RUN_ID" =~ ^ib-[0-9]{12}-[0-9a-f]{4}$ ]] || die "proxmox: unexpected run ID '$RUN_ID'"
+  [[ "$RUN_ID" =~ ^ib-[0-9]{12}-[0-9a-f]{4}([0-9a-f]{12})?$ ]] || die "proxmox: unexpected run ID '$RUN_ID'"
   owned='printf "%s\n" "$w" | grep -qxF image-build='"$RUN_ID"
   mutate pve sh -c "$(_pve_destroy_script "$vmid" "$owned" "is not tagged image-build=$RUN_ID")" >&2
   BUILD_VM_ID=""
@@ -496,7 +497,7 @@ backend_destroy_id() {
   fi
   # Re-checked on the node, in the destroy command itself: one image-build tag
   # in RUN_ID format, and one 12-digit expiry in the past.
-  expired='[ "$(printf "%s\n" "$w" | grep -c "^image-build=")" = 1 ] && printf "%s\n" "$w" | grep -qx "image-build=ib-[0-9]\{12\}-[0-9a-f]\{4\}" && e=$(printf "%s\n" "$w" | sed -n "s/^image-build-expires=//p") && [ "$(printf "%s\n" "$e" | grep -cx "[0-9]\{12\}")" = 1 ] && [ "$e" -lt '"$now"' ]'
+  expired='[ "$(printf "%s\n" "$w" | grep -c "^image-build=")" = 1 ] && printf "%s\n" "$w" | grep -qx "image-build=ib-[0-9]\{12\}-[0-9a-f]\{4\}\([0-9a-f]\{12\}\)\{0,1\}" && e=$(printf "%s\n" "$w" | sed -n "s/^image-build-expires=//p") && [ "$(printf "%s\n" "$e" | grep -cx "[0-9]\{12\}")" = 1 ] && [ "$e" -lt '"$now"' ]'
   mutate pve sh -c "$(_pve_destroy_script "$1" "$expired" "is not a tagged, expired build VM")" >&2
 }
 

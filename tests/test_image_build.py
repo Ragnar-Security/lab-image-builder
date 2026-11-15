@@ -206,7 +206,7 @@ KEY_MATERIAL = "FAKE-PRIVATE-KEY-MATERIAL"
 FULL_SHA = "abc1234def5678901234567890abcdef12345678"
 
 BASE_RECIPE = {
-    "IMAGE_PREFIX": "enpm634-privesc-linux",
+    "IMAGE_PREFIX": "example-lab-linux",
     "OS_FAMILY": "linux",
     "PAYLOAD_DIR": "payload",
     "SETUP": "setup.sh",
@@ -291,7 +291,7 @@ def _build_env(tmp_path: Path, os_family: str = "linux", drop=(), **overrides):
     recipe = dict(BASE_RECIPE)
     if os_family == "windows":
         recipe.update(OS_FAMILY="windows", SETUP="setup.ps1", VERIFY="verify.ps1",
-                      IMAGE_PREFIX="enpm634-privesc-windows")
+                      IMAGE_PREFIX="example-lab-windows")
     recipe.update(overrides)
     for key in drop:
         recipe.pop(key)
@@ -399,7 +399,7 @@ def test_order_of_operations(tmp_path):
     date, backend, image_id, image_name, base_id, recipe_rel, commit, verify = lines[1].split("\t")
     assert backend == "fake"
     assert image_id == f"img-{image_name}"
-    assert image_name.startswith("enpm634-privesc-linux-abc1234-")
+    assert image_name.startswith("example-lab-linux-abc1234-")
     assert base_id == "base-1234"
     assert "backend_resolve_base fake-base-*" in calls
     assert "backend_start ib-" in calls and " base-1234 " in calls
@@ -780,9 +780,9 @@ def test_image_name_shape(tmp_path):
     assert result.returncode == 0, result.stderr
     save = [l for l in _calls(tmp_path).splitlines() if l.startswith("backend_save ")]
     name = save[0].split(" ", 1)[1]
-    assert re.fullmatch(r"enpm634-privesc-linux-[0-9a-f]{7}-[0-9]{12}", name), name
+    assert re.fullmatch(r"example-lab-linux-[0-9a-f]{7}-[0-9]{12}", name), name
     assert len(name) <= 63
-    for i, prefix in enumerate(("a" * 43, "Enpm634-upper", "enpm634_underscore")):
+    for i, prefix in enumerate(("a" * 43, "Example-upper", "example_underscore")):
         env, recipe = _build_env(tmp_path / str(i), IMAGE_PREFIX=prefix)
         result = _build(env, "--dry-run", recipe, "fake")
         assert result.returncode == 2, prefix
@@ -800,7 +800,7 @@ def test_ttl_changes_expiry(tmp_path):
         assert result.returncode == 0, result.stderr
         start = [l for l in _calls(tmp_path / sub).splitlines() if l.startswith("backend_start ")][0]
         run_id, _base, _pub, expires = start.split(" ")[1:5]
-        m = re.fullmatch(r"ib-([0-9]{12})-[0-9a-f]{4}", run_id)
+        m = re.fullmatch(r"ib-([0-9]{12})-[0-9a-f]{16}", run_id)
         assert m, run_id
         began = datetime.strptime(m.group(1), "%Y%m%d%H%M")
         ends = datetime.strptime(expires.removeprefix("expires="), "%Y%m%d%H%M")

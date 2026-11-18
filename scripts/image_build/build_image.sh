@@ -8,9 +8,12 @@
 # Exit codes: 0 success, 2 usage or config error (only before the build
 # started: past that, any failure is 1), 1 build failure.
 #
-# A build: start a build VM from the backend's base, upload the recipe's payload
-# over SSH, run setup (SETUP_PASSES times; a setup that needs a reboot exits
-# 100 and the core reboots the VM and waits for a new boot ID), run verify,
+# A build: start a build VM from the backend's base, wait until SSH answers
+# several times in a row, upload the recipe's payload over SSH (each upload
+# step is idempotent and is retried on an SSH exit 255, up to
+# IMAGE_BUILD_SSH_WAIT_SECONDS), run setup (SETUP_PASSES times; a setup that
+# needs a reboot exits 100 and the core reboots the VM and waits for a new
+# boot ID), run verify,
 # seal (the matching seal script from this directory), save the image,
 # destroy the build VM. A trap destroys the build VM
 # on every exit, so a failed or interrupted build leaves nothing running. Only a
@@ -46,7 +49,8 @@
 #               relative to PAYLOAD_DIR.
 #   IMAGE_BUILD_TTL_MINUTES   expiry tagged on build resources (default 240).
 #   IMAGE_BUILD_SSH_WAIT_SECONDS  how long to wait for SSH after start and
-#                             after each setup pass or reboot (default 900).
+#                             after each setup pass or reboot, and how long
+#                             the upload may retry exit 255 (default 900).
 #   IMAGE_BUILD_BACKENDS_DIR  where <backend>.sh lives (default: ./backends).
 #
 # Setup contract: exit 0 when done; exit 100 when done but the VM needs a
@@ -113,6 +117,10 @@ BACKEND_FUNCTIONS=(backend_check_config backend_resolve_base backend_start backe
 # log is committed.
 BUILD_LOG_REL="coursework/deploy/image-build/BUILD-LOG.tsv"
 SSH_POLL_SECONDS=10
+# How many SSH answers in a row, SSH_POLL_SECONDS apart, count as SSH being
+# up. A Windows clone's sshd can answer once in its first seconds after boot
+# and then fail the next connection (see wait_ssh).
+SSH_STABLE_PROBES=3
 # A setup's exit code asking the core to reboot the VM.
 SETUP_REBOOT_RC=100
 
@@ -309,6 +317,9 @@ load_config() {
 
 SSH_OPTS=()
 SSH_TARGET=""
+# Seconds an SSH connection may take to connect and exchange banners. The
+# upload lowers it (locally) so that no attempt outlasts its deadline.
+SSH_CONNECT_TIMEOUT=10
 
 ssh_setup() {
   [ -n "$BUILD_SSH_HOST" ] || die "backend_start set no BUILD_SSH_HOST"
@@ -316,15 +327,15 @@ ssh_setup() {
   SSH_TARGET="$BUILD_SSH_USER@$BUILD_SSH_HOST"
   SSH_OPTS=(-i "$TMP_DIR/key" -o IdentitiesOnly=yes -o BatchMode=yes
             -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o LogLevel=ERROR)
+            -o ServerAliveInterval=15 -o LogLevel=ERROR)
   if [ -n "$BUILD_SSH_JUMP" ]; then
     SSH_OPTS+=(-J "$BUILD_SSH_JUMP")
   fi
 }
 
 # One command line on the build VM, as the SSH user. Its output goes to stderr.
-rssh() { mutate ssh -n "${SSH_OPTS[@]}" "$SSH_TARGET" "$1" >&2; }
-rscp() { mutate scp "${SSH_OPTS[@]}" "$1" "$SSH_TARGET:$2" >&2; }
+rssh() { mutate ssh -n "${SSH_OPTS[@]}" -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT" "$SSH_TARGET" "$1" >&2; }
+rscp() { mutate scp "${SSH_OPTS[@]}" -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT" "$1" "$SSH_TARGET:$2" >&2; }
 
 # A command as root (Linux) or in PowerShell (Windows).
 remote_run() {
@@ -347,42 +358,107 @@ remote_script() {
   fi
 }
 
+# One step of the payload upload: $1 is the deadline (in $SECONDS), $2 names
+# the step, the rest is the rssh/rscp call. Every upload step is idempotent, so
+# a step whose connection failed (exit 255, whether or not the command ran) is
+# run again, SSH_POLL_SECONDS apart, until the deadline. No attempt starts at
+# or after the deadline, no sleep runs past it, and each attempt's
+# ConnectTimeout is cut to the time left. Any other failure fails the build.
+# Setup, verify and seal are not idempotent and never go through here.
+upload_step() {
+  local deadline="$1" what="$2" rc left SSH_CONNECT_TIMEOUT="$SSH_CONNECT_TIMEOUT"
+  shift 2
+  while :; do
+    left=$((deadline - SECONDS))
+    # A dry run reaches no VM, so it has no deadline to miss.
+    [ "$DRY_RUN" = 1 ] || [ "$left" -gt 0 ] || upload_give_up "$deadline" "$what"
+    if [ "$left" -lt "$SSH_CONNECT_TIMEOUT" ] && [ "$left" -gt 0 ]; then
+      SSH_CONNECT_TIMEOUT="$left"
+    fi
+    rc=0
+    "$@" || rc=$?
+    [ "$rc" -ne 0 ] || return 0
+    [ "$rc" -eq 255 ] || die "payload upload: $what failed (exit $rc)"
+    left=$((deadline - SECONDS))
+    [ "$left" -gt 0 ] || upload_give_up "$deadline" "$what"
+    [ "$left" -lt "$SSH_POLL_SECONDS" ] || left="$SSH_POLL_SECONDS"
+    log "payload upload: $what lost its SSH connection (exit 255); retrying in ${left}s"
+    run_bg sleep "$left"
+  done
+}
+
+upload_give_up() {
+  if [ "$1" -ge "$BUILD_EXPIRY_DEADLINE" ]; then
+    die "payload upload: $2 stopped at the build's expiry ($BUILD_EXPIRES_UTC UTC, IMAGE_BUILD_TTL_MINUTES=$TTL_MINUTES), after which --reap may destroy the build VM; giving up"
+  fi
+  die "payload upload: $2 still lost its SSH connection (exit 255) after ${SSH_WAIT_SECONDS}s; giving up"
+}
+
 # Upload a directory's contents to /tmp/image-build (Linux) or C:\image-build
 # (Windows), minus PAYLOAD_EXCLUDE. Extracted as the SSH user, so the seal
-# script can be copied in later.
+# script can be copied in later. Each remote step may be retried (upload_step),
+# so the extract leaves the archive for a retry to find, and only the next step
+# removes it. The retries stop at IMAGE_BUILD_SSH_WAIT_SECONDS or at the
+# build's expiry, whichever comes first.
 remote_upload() {
-  local dir="$1" pattern excludes=() patterns=()
+  local dir="$1" pattern excludes=() patterns=() deadline
   read -r -a patterns <<< "${PAYLOAD_EXCLUDE:-}"
   # ${a[@]+...} keeps an empty array legal under set -u on bash 3.2.
   for pattern in ${patterns[@]+"${patterns[@]}"}; do
     excludes+=("--exclude=$pattern")
   done
   mutate tar -C "$dir" -czf "$TMP_DIR/payload.tgz" ${excludes[@]+"${excludes[@]}"} .
+  deadline=$((SECONDS + SSH_WAIT_SECONDS))
+  [ "$deadline" -le "$BUILD_EXPIRY_DEADLINE" ] || deadline="$BUILD_EXPIRY_DEADLINE"
   if [ "$OS_FAMILY" = linux ]; then
-    rssh "mkdir -p /tmp/image-build"
-    rscp "$TMP_DIR/payload.tgz" /tmp/image-build/payload.tgz
-    rssh "tar -xzf /tmp/image-build/payload.tgz -C /tmp/image-build && rm -f /tmp/image-build/payload.tgz"
+    upload_step "$deadline" "create /tmp/image-build" rssh "mkdir -p /tmp/image-build"
+    upload_step "$deadline" "copy payload.tgz" rscp "$TMP_DIR/payload.tgz" /tmp/image-build/payload.tgz
+    upload_step "$deadline" "extract payload.tgz" rssh "tar -xzf /tmp/image-build/payload.tgz -C /tmp/image-build"
+    upload_step "$deadline" "remove payload.tgz" rssh "rm -f /tmp/image-build/payload.tgz"
   else
-    remote_run 'New-Item -ItemType Directory -Force -Path C:\image-build | Out-Null'
-    rscp "$TMP_DIR/payload.tgz" C:/image-build/payload.tgz
-    remote_run 'tar.exe -xzf C:\image-build\payload.tgz -C C:\image-build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Remove-Item -Force C:\image-build\payload.tgz'
+    upload_step "$deadline" "create C:\\image-build" \
+      remote_run 'New-Item -ItemType Directory -Force -Path C:\image-build | Out-Null'
+    upload_step "$deadline" "copy payload.tgz" rscp "$TMP_DIR/payload.tgz" C:/image-build/payload.tgz
+    upload_step "$deadline" "extract payload.tgz" \
+      remote_run 'tar.exe -xzf C:\image-build\payload.tgz -C C:\image-build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
+    upload_step "$deadline" "remove payload.tgz" \
+      remote_run 'if (Test-Path C:\image-build\payload.tgz) { Remove-Item -Force C:\image-build\payload.tgz }'
   fi
 }
 
+# Wait until SSH answers SSH_STABLE_PROBES times in a row, SSH_POLL_SECONDS
+# apart; a failed probe starts the count again. $1 is the deadline (in
+# $SECONDS), $2 the error if it passes first. One answer is not enough: on a
+# Proxmox clone of base-ws2022, sshd (started by SetupComplete.cmd) answered
+# once and then failed the next connection with exit 255 or a banner-exchange
+# timeout, two or three times per build, all in the first seconds after boot.
+# The same wait costs a Linux VM only the extra probes.
+wait_stable_ssh() {
+  local deadline="$1" why="$2" ok=0
+  while :; do
+    if run_bg ssh -n "${SSH_OPTS[@]}" -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT" "$SSH_TARGET" "exit 0" \
+        >/dev/null 2>&1; then
+      ok=$((ok + 1))
+      [ "$ok" -lt "$SSH_STABLE_PROBES" ] || break
+    else
+      [ "$ok" -eq 0 ] || log "SSH to $SSH_TARGET answered $ok time(s), then failed; counting again"
+      ok=0
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || die "$why"
+    run_bg sleep "$SSH_POLL_SECONDS"
+  done
+  log "SSH to $SSH_TARGET answered $SSH_STABLE_PROBES times in a row"
+}
+
 wait_ssh() {
-  local timeout="$1" deadline
+  local timeout="$1"
   if [ "$DRY_RUN" = 1 ]; then
     rssh "exit 0"
     return 0
   fi
-  deadline=$((SECONDS + timeout))
-  log "waiting up to ${timeout}s for SSH to $SSH_TARGET"
-  until run_bg ssh -n "${SSH_OPTS[@]}" "$SSH_TARGET" "exit 0" >/dev/null 2>&1; do
-    if [ "$SECONDS" -ge "$deadline" ]; then
-      die "no SSH to $SSH_TARGET after ${timeout}s"
-    fi
-    run_bg sleep "$SSH_POLL_SECONDS"
-  done
+  log "waiting up to ${timeout}s for SSH to $SSH_TARGET to answer $SSH_STABLE_PROBES times in a row"
+  wait_stable_ssh $((SECONDS + timeout)) \
+    "no stable SSH to $SSH_TARGET after ${timeout}s (needs $SSH_STABLE_PROBES answers in a row)"
 }
 
 # The command that prints the build VM's boot identity, which changes on
@@ -399,7 +475,8 @@ boot_id_command() {
 # Print the boot ID; non-zero if SSH fails or the answer is not one word.
 read_boot_id() {
   local out
-  out="$(query boot-id-dry-run ssh -n "${SSH_OPTS[@]}" "$SSH_TARGET" "$(boot_id_command)")" || return
+  out="$(query boot-id-dry-run ssh -n "${SSH_OPTS[@]}" -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT" "$SSH_TARGET" \
+    "$(boot_id_command)")" || return
   out="${out//$'\r'/}"
   [[ "$out" =~ ^[A-Za-z0-9.:-]+$ ]] || return 1
   printf '%s\n' "$out"
@@ -431,7 +508,10 @@ reboot_vm() {
 
 # Wait until SSH answers with a boot ID other than $1: the VM went down and
 # came back. A VM still on its way down answers, with its old boot ID, so an
-# answer alone proves nothing. $2 is the error if no new boot shows up.
+# answer alone proves nothing. Then wait, within the same deadline, for SSH to
+# answer SSH_STABLE_PROBES times in a row: a freshly booted Windows VM can
+# answer once and drop the next connection (see wait_stable_ssh). $2 is the
+# error if no new boot shows up.
 wait_new_boot() {
   local before="$1" why="$2" deadline now
   deadline=$((SECONDS + SSH_WAIT_SECONDS))
@@ -440,13 +520,15 @@ wait_new_boot() {
     now="$(read_boot_id 2>/dev/null)" || now=""
     if [ -n "$now" ] && [ "$now" != "$before" ]; then
       log "the VM rebooted (boot ID $before -> $now)"
-      return 0
+      break
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
       die "$why (boot ID still '${now:-unreadable}', was '$before', after ${SSH_WAIT_SECONDS}s)"
     fi
     run_bg sleep "$SSH_POLL_SECONDS"
   done
+  wait_stable_ssh "$deadline" \
+    "the VM came back (boot ID $now) but SSH did not answer $SSH_STABLE_PROBES times in a row within ${SSH_WAIT_SECONDS}s"
 }
 
 # Ubuntu empties /tmp at boot, so a setup that rebooted the VM took the
@@ -666,6 +748,10 @@ fi
 NOW_EPOCH="$(date -u +%s)"
 STAMP="$(utc_stamp "$NOW_EPOCH")"
 BUILD_EXPIRES_UTC="$(utc_stamp $((NOW_EPOCH + TTL_MINUTES * 60)))"
+# The start of the minute BUILD_EXPIRES_UTC names, in $SECONDS: once that
+# minute is over, --reap may destroy the build VM. The upload's retries stop
+# here.
+BUILD_EXPIRY_DEADLINE=$((SECONDS + (NOW_EPOCH + TTL_MINUTES * 60) / 60 * 60 - NOW_EPOCH))
 # 64 random bits, so two builds started in the same minute do not share an ID
 # by chance (16 bits did, one time in 65536 per pair).
 RUN_ID="ib-$STAMP-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"

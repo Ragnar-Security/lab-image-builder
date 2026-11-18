@@ -20,11 +20,19 @@ build_image.sh --reap <backend> [--dry-run]
 
 1. Read the recipe and the config, and check them. Name the image.
 2. Resolve the base image or template for the backend.
-3. Start a build VM from it, with a fresh SSH key made for this run.
-4. Upload the recipe's payload to the VM, over SSH.
+3. Start a build VM from it, with a fresh SSH key made for this run, and wait
+   until SSH answers three times in a row, 10 seconds apart (a failed answer
+   starts the count again).
+4. Upload the recipe's payload to the VM, over SSH. Each upload step (create
+   the payload directory, copy `payload.tgz`, extract it, remove it) is
+   idempotent, so one whose SSH or SCP connection fails with exit 255 is run
+   again every 10 seconds, until `IMAGE_BUILD_SSH_WAIT_SECONDS` runs out or
+   the build expires (`IMAGE_BUILD_TTL_MINUTES`), whichever comes first; any
+   other failure stops the build at once. Setup, verify and seal are never
+   retried. See "SSH at first boot".
 5. Run the setup script, `SETUP_PASSES` times. After each pass, wait for SSH;
-   if the setup asked for a reboot (exit 100), reboot the VM and wait for a
-   new boot. See "Rules for setup scripts".
+   if the setup asked for a reboot (exit 100), reboot the VM, wait for a new
+   boot and then for three answers in a row. See "Rules for setup scripts".
 6. Run the verify script. A failure stops the build; nothing is saved.
 7. Seal the VM (`seal_linux.sh` or `seal_windows.ps1`). A failure stops the
    build; nothing is saved.
@@ -115,9 +123,10 @@ Azure backend `az`, logged in (none is checked in a dry run).
 `IMAGE_BUILD_TTL_MINUTES` (environment, default 240) sets how long a build's
 resources live before `--reap` may remove them.
 `IMAGE_BUILD_SSH_WAIT_SECONDS` (environment, default 900) bounds each wait for
-the build VM: for SSH after it starts and after each setup pass, and for a new
-boot after a reboot. `IMAGE_BUILD_BACKENDS_DIR` (environment) changes where
-`<backend>.sh` is read from.
+the build VM: for SSH after it starts and after each setup pass, for a new
+boot after a reboot, and for the payload upload's retries.
+`IMAGE_BUILD_BACKENDS_DIR` (environment) changes where `<backend>.sh` is read
+from.
 
 ## Recipe keys
 
@@ -196,6 +205,27 @@ Windows. Setup and verify run as root (Linux, through `sudo`) or in PowerShell
 - **The payload never ships.** Setup, verify (which holds solve steps) and any
   tarballs are deleted by the seal. The seal exits 1 if it finds them still
   present, and the build then saves nothing.
+
+### SSH at first boot
+
+One SSH answer does not mean SSH is up. On Proxmox clones of `base-ws2022`,
+`sshd` (started by `SetupComplete.cmd`) answered the builder's first probe
+and then failed the next connection, with exit 255 or a timeout during the
+banner exchange, two or three times in each build, all within the first
+seconds after boot; probes from 28 seconds after boot onwards all succeeded.
+So every wait for SSH needs three answers in a row: after start, after a
+setup pass that exits 0, and after a reboot (once the new boot ID shows up,
+within the same `IMAGE_BUILD_SSH_WAIT_SECONDS`). The upload, which runs first,
+retries only an exit 255, only for its own idempotent steps, and only until
+`IMAGE_BUILD_SSH_WAIT_SECONDS` runs out or the build's expiry
+(`BUILD_EXPIRES_UTC`, the start of that minute) arrives, whichever is first:
+past the expiry `--reap` may destroy the build VM. No attempt starts after
+that deadline, the sleep before a retry is cut short to end at it, and each
+attempt's SSH `ConnectTimeout` (10 s) is cut to the time left. The retries are
+logged (`payload upload: ... lost its SSH connection (exit 255); retrying in
+10s`). An exit 255 during setup still means "the VM rebooted, or the build
+fails"; verify and seal fail on any non-zero exit. Linux builds take the same
+path: it costs them two extra probes (20 seconds) per wait and nothing else.
 
 ## Host SSH: `KEEP_SSH`
 

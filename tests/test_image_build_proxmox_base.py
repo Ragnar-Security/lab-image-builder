@@ -27,7 +27,7 @@ PVE_CONFIG = (
     "PVE_HOST=pve-host.invalid\n"
     "PVE_NODE=pve\n"
     "PVE_STORAGE=build-store\n"
-    "PVE_BUILD_BRIDGE=vmbr9\n"
+    "PVE_BUILD_BRIDGE=vmbrtest\n"
     "PVE_BUILD_VLAN=999\n"
 )
 DATE = "20261113"

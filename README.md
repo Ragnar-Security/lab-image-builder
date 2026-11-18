@@ -16,15 +16,14 @@ The full runbook (config keys, recipe keys, the backend contract, tags,
 reaping, building the Proxmox base templates) is
 [`scripts/image_build/README.md`](scripts/image_build/README.md).
 
-## Recipes live in the course repos
+## Recipes live in the repos that use them
 
 This repo holds the builder only. No recipe, payload, host, account, project
-or image ID is in it. A recipe is a `.env` file inside the git repo of the
-course or lab it builds, next to the payload it uploads; for example,
-`ENPM634-course` keeps shared bases under `coursework/deploy/image-build/` and
-each lab's recipe beside the lab (`<lab>/image/recipe.env`). The image name
-carries the short commit of that repo, so a recipe must be committed before it
-is built.
+or image ID is in it. A recipe is a `.env` file inside the git repository
+whose content it builds, next to the payload it uploads: a consuming
+repository keeps its own recipes and bases next to its content. The image
+name carries the short commit of that repository, so a recipe must be
+committed before it is built.
 
 ## Quick start
 

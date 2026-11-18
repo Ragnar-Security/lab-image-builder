@@ -227,6 +227,9 @@ BASE_RECIPE = {
 # boot-<n>. A reboot command (or one matching FAKE_SSH_REBOOT_ON) makes the
 # boot ID change, but only after FAKE_BOOT_FLIP_AFTER more reads (default 0):
 # a VM still going down answers with its old boot.
+# FAKE_SSH_FAIL_ON fails every matching call with FAKE_SSH_FAIL_RC, or only
+# the first FAKE_SSH_FAIL_TIMES of them. FAKE_SSH_PROBES lists the exit codes
+# of successive readiness probes (`exit 0`); its last code repeats.
 FAKE_SSH = LOG_CALL + (
     'for a in "$@"; do last="$a"; done; printf "%s\\0" "$last" >> "$CALL_LOG.remote"\n'
     'boot="$CALL_LOG.boot"; pending="$CALL_LOG.reboot-pending"\n'
@@ -243,15 +246,33 @@ FAKE_SSH = LOG_CALL + (
     '  echo "${FAKE_BOOT_FLIP_AFTER:-0}" > "$pending" ;;\n'
     'esac\n'
     'case "$last" in *boot_id*|*LastBootUpTime*) echo "boot-$(cat "$boot")"; exit 0 ;; esac\n'
-    'case "$*" in *"${FAKE_SSH_FAIL_ON:-@none@}"*) exit "${FAKE_SSH_FAIL_RC:-1}" ;; esac\n'
-    'case "$*" in *"${FAKE_SSH_SLEEP_ON:-@none@}"*) exec sleep 30 ;; esac\n'
+    'if [ "$last" = "exit 0" ] && [ -n "${FAKE_SSH_PROBES:-}" ]; then\n'
+    '  c="$CALL_LOG.probes"; n=$(cat "$c" 2>/dev/null || echo 0); echo $((n + 1)) > "$c"\n'
+    '  i=0; for code in $FAKE_SSH_PROBES; do rc=$code; [ "$i" -eq "$n" ] && break; i=$((i + 1)); done\n'
+    '  exit "$rc"\n'
+    'fi\n'
+    'case "$*" in *"${FAKE_SSH_FAIL_ON:-@none@}"*)\n'
+    '  c="$CALL_LOG.ssh-fails"; n=$(cat "$c" 2>/dev/null || echo 0); echo $((n + 1)) > "$c"\n'
+    '  [ -n "${FAKE_SSH_FAIL_TIMES:-}" ] && [ "$n" -ge "$FAKE_SSH_FAIL_TIMES" ] || exit "${FAKE_SSH_FAIL_RC:-1}" ;;\n'
+    'esac\n'
+    # The real sleep, not the harness's fast one: the build must be signalled
+    # while this command still runs.
+    'case "$*" in *"${FAKE_SSH_SLEEP_ON:-@none@}"*) PATH=/usr/bin:/bin exec sleep 30 ;; esac\n'
     "exit 0\n"
 )
 # Copies the uploaded file (second-to-last argument) into $SCP_SINK.
+# FAKE_SCP_FAIL_ON / _RC / _TIMES work as FAKE_SSH_FAIL_ON does.
 FAKE_SCP = LOG_CALL + (
+    'case "$*" in *"${FAKE_SCP_FAIL_ON:-@none@}"*)\n'
+    '  c="$CALL_LOG.scp-fails"; n=$(cat "$c" 2>/dev/null || echo 0); echo $((n + 1)) > "$c"\n'
+    '  [ -n "${FAKE_SCP_FAIL_TIMES:-}" ] && [ "$n" -ge "$FAKE_SCP_FAIL_TIMES" ] || exit "${FAKE_SCP_FAIL_RC:-1}" ;;\n'
+    'esac\n'
     'n=0; for a in "$@"; do n=$((n + 1)); [ "$n" -eq $(($# - 1)) ] && src="$a"; done\n'
     'mkdir -p "$SCP_SINK" && cp "$src" "$SCP_SINK/"\n'
 )
+# The core's poll sleeps (SSH readiness, upload retries, reboot waits), cut
+# short so a build does not take minutes. Not logged; _fast_sleep logs them.
+FAKE_SLEEP = "PATH=/usr/bin:/bin exec sleep 0.01\n"
 FAKE_KEYGEN = LOG_CALL + (
     'while [ $# -gt 0 ]; do [ "$1" = -f ] && f="$2"; shift; done\n'
     f"printf '{KEY_MATERIAL}\\n' > \"$f\"\n"
@@ -306,7 +327,7 @@ def _build_env(tmp_path: Path, os_family: str = "linux", drop=(), **overrides):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for name, body in (("ssh", FAKE_SSH), ("scp", FAKE_SCP), ("ssh-keygen", FAKE_KEYGEN),
-                       ("git", FAKE_GIT), ("fake-cloud", FAKE_CLOUD)):
+                       ("git", FAKE_GIT), ("fake-cloud", FAKE_CLOUD), ("sleep", FAKE_SLEEP)):
         _tool(bin_dir, name, body)
     config = tmp_path / "config.env"
     config.write_text("FAKE_REGION='test-1'\n")
@@ -1031,3 +1052,215 @@ def test_backend_midway_failure_not_masked(tmp_path):
     result, calls = run("destroy_id", "backend_destroy_id", "--reap", "fake")
     assert result.returncode == 1
     assert "fake-cloud destroy" not in calls
+
+
+# --- first-boot SSH race -----------------------------------------------------
+# A Windows clone's sshd can answer once in its first seconds after boot and
+# then fail the next connection with exit 255 (measured on Proxmox clones of
+# base-ws2022). The core waits until SSH answers several times in a row, and
+# retries only the idempotent payload-upload steps, only on exit 255.
+
+UPLOAD_STEPS = {
+    "linux": (("ssh", "mkdir -p /tmp/image-build"),
+              ("scp", ":/tmp/image-build/payload.tgz"),
+              ("ssh", "tar -xzf /tmp/image-build/payload.tgz"),
+              ("ssh", "rm -f /tmp/image-build/payload.tgz")),
+    "windows": (("ssh", "New-Item -ItemType Directory -Force -Path C:\\image-build"),
+                ("scp", ":C:/image-build/payload.tgz"),
+                ("ssh", "tar.exe -xzf C:\\image-build\\payload.tgz"),
+                ("ssh", "Remove-Item -Force C:\\image-build\\payload.tgz")),
+}
+SCRIPTS = {"linux": ("setup.sh", "verify.sh", "seal_linux.sh"),
+           "windows": ("setup.ps1", "verify.ps1", "seal_windows.ps1")}
+RETRY_LINE = "(exit 255); retrying"
+
+
+def _fail(env: dict, tool: str, marker: str, rc: int, times=None) -> None:
+    prefix = {"ssh": "FAKE_SSH", "scp": "FAKE_SCP"}[tool]
+    env.update({f"{prefix}_FAIL_ON": marker, f"{prefix}_FAIL_RC": str(rc)})
+    if times is not None:
+        env[f"{prefix}_FAIL_TIMES"] = str(times)
+
+
+def _matching(calls: str, tool: str, marker: str) -> list:
+    return [l for l in _remote_commands(calls, tool) if marker in l]
+
+
+def test_upload_step_retried_on_255(tmp_path):
+    for os_family, steps in UPLOAD_STEPS.items():
+        setup, verify, seal = SCRIPTS[os_family]
+        for i, (tool, marker) in enumerate(steps):
+            sub = tmp_path / f"{os_family}-{i}"
+            env, recipe = _build_env(sub, os_family)
+            _fail(env, tool, marker, 255, times=2)
+            result = _build(env, recipe, "fake")
+            assert result.returncode == 0, (marker, result.stderr)
+            calls = _calls(sub)
+            tries = _matching(calls, tool, marker)
+            assert len(tries) == 3, (marker, tries)
+            assert result.stderr.count(RETRY_LINE) == 2, result.stderr
+            events = _events(calls, setup, verify, seal)
+            assert [e for e in events if e != "upload"] == [
+                "check_config", "resolve_base", "start", "setup", "verify", "seal", "save", "destroy"], events
+            assert events.index("upload") < events.index("setup"), events
+            if "tar" in marker:
+                # A retried extract must find its archive again: it never
+                # deletes the archive itself.
+                assert all("rm -f" not in t and "Remove-Item" not in t for t in tries), tries
+
+
+def test_upload_gives_up_after_deadline(tmp_path):
+    for os_family, steps in UPLOAD_STEPS.items():
+        setup, verify, seal = SCRIPTS[os_family]
+        for i, (tool, marker) in enumerate(steps[:2]):
+            sub = tmp_path / f"{os_family}-{i}"
+            env, recipe = _build_env(sub, os_family)
+            _fast_sleep(sub)
+            _fail(env, tool, marker, 255)
+            env["IMAGE_BUILD_SSH_WAIT_SECONDS"] = "2"
+            started = time.monotonic()
+            result = _build(env, recipe, "fake")
+            assert result.returncode == 1, result.stderr
+            assert time.monotonic() - started < 30
+            assert "giving up" in result.stderr, result.stderr
+            calls = _calls(sub)
+            assert len(_matching(calls, tool, marker)) >= 2
+            events = _events(calls, setup, verify, seal)
+            assert "setup" not in events and "save" not in events, events
+            assert events[-1] == "destroy", events
+
+
+def test_upload_failure_other_than_255_not_retried(tmp_path):
+    for os_family, steps in UPLOAD_STEPS.items():
+        setup, verify, seal = SCRIPTS[os_family]
+        for i, (tool, marker) in enumerate(steps):
+            sub = tmp_path / f"{os_family}-{i}"
+            env, recipe = _build_env(sub, os_family)
+            # It would succeed if tried again.
+            _fail(env, tool, marker, 1, times=1)
+            result = _build(env, recipe, "fake")
+            assert result.returncode == 1, result.stderr
+            calls = _calls(sub)
+            assert len(_matching(calls, tool, marker)) == 1, marker
+            assert RETRY_LINE not in result.stderr
+            assert "payload upload: " in result.stderr and "(exit 1)" in result.stderr, result.stderr
+            events = _events(calls, setup, verify, seal)
+            assert "setup" not in events and "save" not in events, events
+            assert events[-1] == "destroy", events
+
+
+def test_setup_verify_seal_never_retried(tmp_path):
+    # The upload hits the race (and is retried once); a later exit 255 is not
+    # retried. Setup, verify and seal are not idempotent.
+    for os_family, steps in UPLOAD_STEPS.items():
+        setup, verify, seal = SCRIPTS[os_family]
+        (dir_tool, dir_marker), (scp_tool, scp_marker) = steps[0], steps[1]
+        cases = [(f"ssh-{n}", ("ssh", s), (scp_tool, scp_marker))
+                 for n, s in zip(("setup", "verify", "seal"), (setup, verify, seal))]
+        # The copy of the seal script into the VM is part of the seal.
+        cases.append(("scp-seal", ("scp", seal), (dir_tool, dir_marker)))
+        for name, (tool, marker), (race_tool, race_marker) in cases:
+            # No marker in the directory name: the key path is in every ssh line.
+            sub = tmp_path / f"{os_family}-{name}"
+            env, recipe = _build_env(sub, os_family)
+            _fail(env, race_tool, race_marker, 255, times=1)
+            _fail(env, tool, marker, 255)
+            env["IMAGE_BUILD_SSH_WAIT_SECONDS"] = "2"
+            result = _build(env, recipe, "fake")
+            assert result.returncode == 1, (name, result.stderr)
+            calls = _calls(sub)
+            assert len(_matching(calls, race_tool, race_marker)) == 2, (name, calls)
+            assert len(_matching(calls, tool, marker)) == 1, (name, _matching(calls, tool, marker))
+            assert result.stderr.count(RETRY_LINE) == 1, (name, result.stderr)
+            events = _events(calls, setup, verify, seal)
+            assert "save" not in events and events[-1] == "destroy", (name, events)
+
+
+def test_wait_ssh_needs_consecutive_successes(tmp_path):
+    for os_family, steps in UPLOAD_STEPS.items():
+        sub = tmp_path / os_family
+        env, recipe = _build_env(sub, os_family)
+        # Answers, drops, answers twice, drops, then stays up.
+        env["FAKE_SSH_PROBES"] = "0 255 0 0 255 0 0 0"
+        result = _build(env, recipe, "fake")
+        assert result.returncode == 0, result.stderr
+        remote = _remote_lines(sub)
+        first_upload = next(i for i, c in enumerate(remote) if steps[0][1] in c)
+        # The upload starts only after three answers in a row.
+        assert remote[:first_upload] == ["exit 0"] * 8, remote
+        assert "answered 3 times in a row" in result.stderr, result.stderr
+
+    # Never three in a row: the build stops when the wait runs out.
+    sub = tmp_path / "unstable"
+    env, recipe = _build_env(sub, "windows")
+    _fast_sleep(sub)
+    env.update(FAKE_SSH_PROBES="0 0 255", IMAGE_BUILD_SSH_WAIT_SECONDS="2")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 1, result.stderr
+    assert "no stable SSH" in result.stderr, result.stderr
+    events = _events(_calls(sub), *SCRIPTS["windows"])
+    assert "upload" not in events and "setup" not in events, events
+    assert events[-1] == "destroy", events
+
+
+def test_new_boot_needs_stable_ssh_before_next_pass(tmp_path):
+    # After a reboot the VM answers with its new boot ID, then drops one
+    # connection: the next pass starts only after three answers in a row.
+    for os_family in ("linux", "windows"):
+        setup, verify, _seal = SCRIPTS[os_family]
+        sub = tmp_path / os_family
+        env, recipe = _build_env(sub, os_family, SETUP_PASSES="2")
+        _fail(env, "ssh", setup, 100, times=1)
+        # Three for the first wait; then ok, fail, ok, ok, ok after the reboot.
+        env["FAKE_SSH_PROBES"] = "0 0 0 0 255 0 0 0"
+        result = _build(env, recipe, "fake")
+        assert result.returncode == 0, result.stderr
+        timeline = _timeline(sub)
+        commands = [c for _b, c in timeline]
+        setups = [i for i, c in enumerate(commands) if setup in c]
+        assert len(setups) == 2, commands
+        new_boot = next(i for i, (b, c) in enumerate(timeline) if b == "boot-2" and _is_boot_read(c))
+        probes = [c for c in commands[new_boot + 1:setups[1]] if c == "exit 0"]
+        assert probes == ["exit 0"] * 5, commands
+        assert timeline[setups[1]][0] == "boot-2", timeline
+        tail = result.stderr[result.stderr.index("the VM rebooted"):]
+        assert "answered 1 time(s), then failed; counting again" in tail, result.stderr
+        assert "answered 3 times in a row" in tail, result.stderr
+
+
+def test_upload_retry_stops_at_build_expiry(tmp_path):
+    # IMAGE_BUILD_SSH_WAIT_SECONDS outlasts the build's TTL: the retries stop
+    # at the expiry, and no attempt starts after it.
+    for os_family in ("linux", "windows"):
+        setup, verify, seal = SCRIPTS[os_family]
+        sub = tmp_path / os_family
+        env, recipe = _build_env(sub, os_family)
+        bin_dir = sub / "bin"
+        # The clock reads 55 s into a minute, so a 1-minute TTL expires in 5 s.
+        now = int(time.time())
+        _tool(bin_dir, "date", 'if [ "$*" = "-u +%s" ]; then echo "$FAKE_NOW"; exit 0; fi\n'
+                               'PATH=/usr/bin:/bin exec date "$@"\n')
+        # Sleeps shorter than the 10 s poll (a clamped one) are real.
+        _tool(bin_dir, "sleep", LOG_CALL + 'case "$1" in [0-9]) PATH=/usr/bin:/bin exec sleep "$1" ;; esac\n'
+                                           'PATH=/usr/bin:/bin exec sleep 0.01\n')
+        tool, marker = UPLOAD_STEPS[os_family][1]
+        _fail(env, tool, marker, 255)
+        env.update(FAKE_NOW=str(now - now % 60 + 55), IMAGE_BUILD_TTL_MINUTES="1",
+                   IMAGE_BUILD_SSH_WAIT_SECONDS="30")
+        started = time.monotonic()
+        result = _build(env, recipe, "fake")
+        assert result.returncode == 1, result.stderr
+        assert time.monotonic() - started < 15, result.stderr
+        assert "stopped at the build's expiry" in result.stderr, result.stderr
+        assert "IMAGE_BUILD_TTL_MINUTES=1" in result.stderr, result.stderr
+        calls = _calls(sub).splitlines()
+        tries = [i for i, l in enumerate(calls) if l.startswith("scp ") and marker in l]
+        assert len(tries) == 1, calls
+        # The attempt's connect timeout and the sleep after it fit in what was left.
+        timeout = int(re.search(r"ConnectTimeout=(\d+)", calls[tries[0]]).group(1))
+        assert 1 <= timeout <= 5, calls[tries[0]]
+        sleeps = [i for i, l in enumerate(calls) if l.startswith("sleep ")]
+        assert int(calls[sleeps[-1]].split()[1]) <= 5, calls
+        assert tries[-1] < sleeps[-1], calls
+        events = _events("\n".join(calls), setup, verify, seal)
+        assert "setup" not in events and events[-1] == "destroy", events

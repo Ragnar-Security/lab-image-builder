@@ -28,7 +28,7 @@ PVE_CONFIG = (
     "PVE_REPLICA_HOST=pve2-host.invalid\n"
     "PVE_STORAGE=build-store\n"
     "PVE_REPLICA_STORAGE=replica-store\n"
-    "PVE_BUILD_BRIDGE=vmbr9\n"
+    "PVE_BUILD_BRIDGE=vmbrtest\n"
     "PVE_BUILD_VLAN=999\n"
 )
 BASE_VMID = 8100
@@ -713,10 +713,10 @@ def test_proxmox_start_tags_and_configures(tmp_path):
                                    opts["--description"]).groups()
     assert opts == {"--name": run_id, "--full": "1", "--storage": "build-store",
                     "--description": f"image-build={run_id} image-build-expires={expires}"}
-    assert "qm set 8000 --memory 2048 --cores 2 --net0 virtio,bridge=vmbr9,tag=999" in pve, pve
+    assert "qm set 8000 --memory 2048 --cores 2 --net0 virtio,bridge=vmbrtest,tag=999" in pve, pve
     assert "lab-playground-site" not in "".join(pve)
     assert pve.index("qm start 8000") > pve.index("qm set 8000 --memory 2048 --cores 2 "
-                                                  "--net0 virtio,bridge=vmbr9,tag=999")
+                                                  "--net0 virtio,bridge=vmbrtest,tag=999")
 
 
 def _guest_exec(tmp_path: Path) -> list:

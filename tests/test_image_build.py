@@ -1201,3 +1201,66 @@ def test_wait_ssh_needs_consecutive_successes(tmp_path):
     events = _events(_calls(sub), *SCRIPTS["windows"])
     assert "upload" not in events and "setup" not in events, events
     assert events[-1] == "destroy", events
+
+
+def test_new_boot_needs_stable_ssh_before_next_pass(tmp_path):
+    # After a reboot the VM answers with its new boot ID, then drops one
+    # connection: the next pass starts only after three answers in a row.
+    for os_family in ("linux", "windows"):
+        setup, verify, _seal = SCRIPTS[os_family]
+        sub = tmp_path / os_family
+        env, recipe = _build_env(sub, os_family, SETUP_PASSES="2")
+        _fail(env, "ssh", setup, 100, times=1)
+        # Three for the first wait; then ok, fail, ok, ok, ok after the reboot.
+        env["FAKE_SSH_PROBES"] = "0 0 0 0 255 0 0 0"
+        result = _build(env, recipe, "fake")
+        assert result.returncode == 0, result.stderr
+        timeline = _timeline(sub)
+        commands = [c for _b, c in timeline]
+        setups = [i for i, c in enumerate(commands) if setup in c]
+        assert len(setups) == 2, commands
+        new_boot = next(i for i, (b, c) in enumerate(timeline) if b == "boot-2" and _is_boot_read(c))
+        probes = [c for c in commands[new_boot + 1:setups[1]] if c == "exit 0"]
+        assert probes == ["exit 0"] * 5, commands
+        assert timeline[setups[1]][0] == "boot-2", timeline
+        tail = result.stderr[result.stderr.index("the VM rebooted"):]
+        assert "answered 1 time(s), then failed; counting again" in tail, result.stderr
+        assert "answered 3 times in a row" in tail, result.stderr
+
+
+def test_upload_retry_stops_at_build_expiry(tmp_path):
+    # IMAGE_BUILD_SSH_WAIT_SECONDS outlasts the build's TTL: the retries stop
+    # at the expiry, and no attempt starts after it.
+    for os_family in ("linux", "windows"):
+        setup, verify, seal = SCRIPTS[os_family]
+        sub = tmp_path / os_family
+        env, recipe = _build_env(sub, os_family)
+        bin_dir = sub / "bin"
+        # The clock reads 55 s into a minute, so a 1-minute TTL expires in 5 s.
+        now = int(time.time())
+        _tool(bin_dir, "date", 'if [ "$*" = "-u +%s" ]; then echo "$FAKE_NOW"; exit 0; fi\n'
+                               'PATH=/usr/bin:/bin exec date "$@"\n')
+        # Sleeps shorter than the 10 s poll (a clamped one) are real.
+        _tool(bin_dir, "sleep", LOG_CALL + 'case "$1" in [0-9]) PATH=/usr/bin:/bin exec sleep "$1" ;; esac\n'
+                                           'PATH=/usr/bin:/bin exec sleep 0.01\n')
+        tool, marker = UPLOAD_STEPS[os_family][1]
+        _fail(env, tool, marker, 255)
+        env.update(FAKE_NOW=str(now - now % 60 + 55), IMAGE_BUILD_TTL_MINUTES="1",
+                   IMAGE_BUILD_SSH_WAIT_SECONDS="30")
+        started = time.monotonic()
+        result = _build(env, recipe, "fake")
+        assert result.returncode == 1, result.stderr
+        assert time.monotonic() - started < 15, result.stderr
+        assert "stopped at the build's expiry" in result.stderr, result.stderr
+        assert "IMAGE_BUILD_TTL_MINUTES=1" in result.stderr, result.stderr
+        calls = _calls(sub).splitlines()
+        tries = [i for i, l in enumerate(calls) if l.startswith("scp ") and marker in l]
+        assert len(tries) == 1, calls
+        # The attempt's connect timeout and the sleep after it fit in what was left.
+        timeout = int(re.search(r"ConnectTimeout=(\d+)", calls[tries[0]]).group(1))
+        assert 1 <= timeout <= 5, calls[tries[0]]
+        sleeps = [i for i, l in enumerate(calls) if l.startswith("sleep ")]
+        assert int(calls[sleeps[-1]].split()[1]) <= 5, calls
+        assert tries[-1] < sleeps[-1], calls
+        events = _events("\n".join(calls), setup, verify, seal)
+        assert "setup" not in events and events[-1] == "destroy", events

@@ -26,12 +26,13 @@ build_image.sh --reap <backend> [--dry-run]
 4. Upload the recipe's payload to the VM, over SSH. Each upload step (create
    the payload directory, copy `payload.tgz`, extract it, remove it) is
    idempotent, so one whose SSH or SCP connection fails with exit 255 is run
-   again every 10 seconds, for at most `IMAGE_BUILD_SSH_WAIT_SECONDS`; any
+   again every 10 seconds, until `IMAGE_BUILD_SSH_WAIT_SECONDS` runs out or
+   the build expires (`IMAGE_BUILD_TTL_MINUTES`), whichever comes first; any
    other failure stops the build at once. Setup, verify and seal are never
    retried. See "SSH at first boot".
 5. Run the setup script, `SETUP_PASSES` times. After each pass, wait for SSH;
-   if the setup asked for a reboot (exit 100), reboot the VM and wait for a
-   new boot. See "Rules for setup scripts".
+   if the setup asked for a reboot (exit 100), reboot the VM, wait for a new
+   boot and then for three answers in a row. See "Rules for setup scripts".
 6. Run the verify script. A failure stops the build; nothing is saved.
 7. Seal the VM (`seal_linux.sh` or `seal_windows.ps1`). A failure stops the
    build; nothing is saved.
@@ -212,14 +213,19 @@ One SSH answer does not mean SSH is up. On Proxmox clones of `base-ws2022`,
 and then failed the next connection, with exit 255 or a timeout during the
 banner exchange, two or three times in each build, all within the first
 seconds after boot; probes from 28 seconds after boot onwards all succeeded.
-So every wait for SSH (after start and after a setup pass that exits 0) needs
-three answers in a row, and the upload, which runs first, retries only an exit
-255, only for its own idempotent steps, and only until
-`IMAGE_BUILD_SSH_WAIT_SECONDS` runs out. The retries are logged
-(`payload upload: ... lost its SSH connection (exit 255); retrying in 10s`).
-An exit 255 during setup still means "the VM rebooted, or the build fails";
-verify and seal fail on any non-zero exit. Linux builds take the same path:
-it costs them two extra probes (20 seconds) per wait and nothing else.
+So every wait for SSH needs three answers in a row: after start, after a
+setup pass that exits 0, and after a reboot (once the new boot ID shows up,
+within the same `IMAGE_BUILD_SSH_WAIT_SECONDS`). The upload, which runs first,
+retries only an exit 255, only for its own idempotent steps, and only until
+`IMAGE_BUILD_SSH_WAIT_SECONDS` runs out or the build's expiry
+(`BUILD_EXPIRES_UTC`, the start of that minute) arrives, whichever is first:
+past the expiry `--reap` may destroy the build VM. No attempt starts after
+that deadline, the sleep before a retry is cut short to end at it, and each
+attempt's SSH `ConnectTimeout` (10 s) is cut to the time left. The retries are
+logged (`payload upload: ... lost its SSH connection (exit 255); retrying in
+10s`). An exit 255 during setup still means "the VM rebooted, or the build
+fails"; verify and seal fail on any non-zero exit. Linux builds take the same
+path: it costs them two extra probes (20 seconds) per wait and nothing else.
 
 ## Host SSH: `KEEP_SSH`
 

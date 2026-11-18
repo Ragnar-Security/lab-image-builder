@@ -98,10 +98,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   payload upload when `sshd` answers once at first boot and then drops the
   next connection (exit 255 or a banner-exchange timeout, measured two or
   three times per build). Every wait for SSH now needs three answers in a
-  row, 10 seconds apart, and each idempotent upload step (create the payload
-  directory, copy `payload.tgz`, extract it, remove it) is retried on an SSH
-  or SCP exit 255, every 10 seconds, until `IMAGE_BUILD_SSH_WAIT_SECONDS`
-  runs out. Any other exit fails the build at once, and setup, verify and
-  seal are never retried. The extract no longer deletes the archive itself,
+  row, 10 seconds apart, including the wait after a reboot once the new boot
+  ID shows up. Each idempotent upload step (create the payload directory,
+  copy `payload.tgz`, extract it, remove it) is retried on an SSH or SCP exit
+  255, every 10 seconds, until `IMAGE_BUILD_SSH_WAIT_SECONDS` runs out or the
+  build's expiry arrives, whichever is first; no attempt or sleep runs past
+  that deadline. Any other exit fails the build at once, and setup, verify
+  and seal are never retried. The extract no longer deletes the archive itself,
   so a retried extract still finds it. Builds no longer need an operator's
   `ssh`/`scp` retry wrapper.

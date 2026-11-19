@@ -40,10 +40,46 @@ build_image.sh --reap <backend> [--dry-run]
 9. Append a line to the build log.
 10. Destroy the build VM and print the `templates.yaml` lines.
 
-A trap destroys the build VM on every exit, including an error, Ctrl-C and
-SIGTERM. If the destroy itself fails, the script says so and tells you to run
-`--reap`. Only a build that passed verify and seal is saved, logged and
-printed.
+A trap destroys the build VM on every exit, including an error, Ctrl-C,
+SIGTERM and SIGHUP, in any phase (start, SSH wait, upload, setup, verify,
+seal, save), and then removes the run's temporary directory (the build key
+and `payload.tgz`). If the destroy itself fails, the script says so and tells
+you to run `--reap`. Only a build that passed verify and seal is saved, logged
+and printed.
+
+The trap holds up when the signal also killed the processes around the
+builder:
+
+- It sends TERM to the in-flight child (the setup `ssh`, an upload `scp`)
+  and everything under it (found with `pgrep -P`), waits up to
+  `IMAGE_BUILD_CHILD_STOP_SECONDS` (default 20), then KILLs whatever is
+  left. The destroy's process tree is killed the same way at its bound.
+- It removes the run's temporary directory (the build key and
+  `payload.tgz`) next, before the destroy: no backend's destroy needs them,
+  so they are gone even if the destroy hangs.
+- It ignores SIGPIPE, and its first log line tells it whether stderr still
+  has a reader. If the signal also killed the reader (a `tee`, or the pipe
+  into a log file), stderr moves to `/dev/null`, so neither the trap nor the
+  destroy it runs dies writing to the dead pipe. Its messages are then lost;
+  the exit code still says the build was stopped.
+- It ignores every further HUP, INT and TERM, and so do the tools the destroy
+  runs, so a second signal (another Ctrl-C, a signal to the whole process
+  group) cannot cut the destroy short. The trap runs once; the destroy is run
+  once.
+- Because it cannot be interrupted, the destroy is bounded instead: after
+  `IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS` (default 900) it is KILLed, and the
+  trap prints one line starting `ERROR: the destroy did not finish` that
+  names the backend and the build VM to destroy by hand. The exit code stays
+  the signal's (or 1 on a failure). Some destroys wait for the deletion to
+  finish (an Azure resource-group delete; on AWS, `aws ec2 wait
+  instance-terminated`, which gives up after 10 minutes), so do not set the
+  bound much lower on those backends.
+
+To stop a build, signal the `build_image.sh` process itself
+(`kill -TERM <pid>`). Whether it shares a process group with whatever launched
+it depends on the launcher, so a signal to the launcher's group may not reach
+it. `kill -9` cannot be trapped: a build stopped that way leaves its build VM
+for `--reap`.
 
 **It does not:** edit `templates.yaml` (it prints lines for you to paste),
 push anything, touch the portal's database, or copy an image between clouds.
@@ -58,8 +94,8 @@ reaped). Everything else, including every `DRY-RUN:` line, goes to stderr.
 |---|---|
 | 0 | Success |
 | 1 | A build or reap failed while running. This includes errors a backend raises after the config passed: a malformed `BASE_AWS`, `BASE_GCP` or `BASE_AZURE`, no image matching the base, a base of the other OS family (Azure), a malformed `AWS_INSTANCE_TYPE`, a bad public key, a VMID outside the Proxmox block, a failed setup, verify or seal, no SSH (or no new boot after a reboot) within `IMAGE_BUILD_SSH_WAIT_SECONDS`, a destroy that was refused. Once the build has begun (base resolution onwards), every failure is 1, even one where a backend or a tool it ran exited 2. |
-| 2 | The core rejected the input before any VM started: bad usage or option, unknown backend, unreadable recipe, a missing or invalid recipe key (`OS_FAMILY`, `KEEP_SSH`, the integer keys including a set `*_DISK_GB` override, `PAYLOAD_DIR`, `SETUP`/`VERIFY`), a missing `BASE_<BACKEND>` key, a recipe key the backend requires (`AZURE_VM_SIZE` on Azure), a recipe outside a git repo, a dirty repo, an invalid `IMAGE_BUILD_TTL_MINUTES` or `IMAGE_BUILD_SSH_WAIT_SECONDS`, an invalid image name, a config that sets a recipe key, or a config the backend's `backend_check_config` rejects. |
-| 130, 143 | Interrupted (INT) or terminated (TERM); the trap still ran |
+| 2 | The core rejected the input before any VM started: bad usage or option, no `pgrep` (except in a dry run), unknown backend, unreadable recipe, a missing or invalid recipe key (`OS_FAMILY`, `KEEP_SSH`, the integer keys including a set `*_DISK_GB` override, `PAYLOAD_DIR`, `SETUP`/`VERIFY`), a missing `BASE_<BACKEND>` key, a recipe key the backend requires (`AZURE_VM_SIZE` on Azure), a recipe outside a git repo, a dirty repo, an invalid `IMAGE_BUILD_TTL_MINUTES`, `IMAGE_BUILD_SSH_WAIT_SECONDS`, `IMAGE_BUILD_CHILD_STOP_SECONDS` or `IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS`, an invalid image name, a config that sets a recipe key, or a config the backend's `backend_check_config` rejects. |
+| 129, 130, 143 | Hung up (HUP), interrupted (INT) or terminated (TERM); the trap still ran |
 
 ### Image names and the build log
 
@@ -116,6 +152,11 @@ recipe sets those.
 | Azure | `AZ_GALLERY_RG` | Resource group of the Azure Compute Gallery. |
 | Azure | `AZ_GALLERY` | Name of the gallery (letters, digits, `.` and `_`). |
 
+Every build and every `--reap` needs `pgrep` (procps on Linux; macOS ships
+it). The exit trap uses `pgrep -P` to find everything a stopped command
+started, so the builder refuses to start without it (exit 2); a dry run does
+not need it.
+
 The Proxmox backend needs `python3` on the machine running the build. The AWS
 backend needs the AWS CLI v2 on `PATH`, the GCP backend `gcloud`, and the
 Azure backend `az`, logged in (none is checked in a dry run).
@@ -127,6 +168,10 @@ the build VM: for SSH after it starts and after each setup pass, for a new
 boot after a reboot, and for the payload upload's retries.
 `IMAGE_BUILD_BACKENDS_DIR` (environment) changes where `<backend>.sh` is read
 from.
+`IMAGE_BUILD_CHILD_STOP_SECONDS` (environment, default 20) and
+`IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS` (environment, default 900) bound the
+exit trap: how long the running command gets after TERM before KILL, and how
+long the trap's destroy may run (see "What it does").
 
 ## Recipe keys
 

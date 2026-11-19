@@ -260,6 +260,11 @@ FAKE_SSH = LOG_CALL + (
     # The real sleep, not the harness's fast one: the build must be signalled
     # while this command still runs.
     'case "$*" in *"${FAKE_SSH_SLEEP_ON:-@none@}"*) PATH=/usr/bin:/bin exec sleep 30 ;; esac\n'
+    # A command that ignores TERM (the sleep inherits the ignore through exec)
+    # and records its PID once it does.
+    'case "$*" in *"${FAKE_SSH_STUBBORN_ON:-@none@}"*)\n'
+    '  trap "" TERM; echo $$ > "$CALL_LOG.stubborn"; PATH=/usr/bin:/bin exec sleep 60 ;;\n'
+    'esac\n'
     "exit 0\n"
 )
 # Copies the uploaded file (second-to-last argument) into $SCP_SINK.
@@ -670,10 +675,16 @@ def test_config_cannot_touch_core_state_or_recipe_keys(tmp_path):
 # A destroy that, like an SSH session relaying the backend's output, fails if
 # it cannot write to its stderr. FAKE_DESTROY_SLEEP makes it take that long,
 # after marking $CALL_LOG.destroying; $CALL_LOG.destroyed gets one line per
-# destroy that ran to the end.
+# destroy that ran to the end. FAKE_DESTROY_HANG makes it hang (with TERM
+# ignored, as the trap leaves it) after recording its PID and what was left in
+# TMPDIR when it started.
 FAKE_CLOUD_DESTROY = (
     'if [ "$1" = destroy ]; then\n'
     '  echo "fake-cloud: destroying $2" >&2 || exit 1\n'
+    '  if [ -n "${FAKE_DESTROY_HANG:-}" ]; then\n'
+    '    ls -A "$TMPDIR" > "$CALL_LOG.tmp-at-destroy"; echo $$ > "$CALL_LOG.hung"\n'
+    '    PATH=/usr/bin:/bin exec sleep 60\n'
+    '  fi\n'
     '  if [ -n "${FAKE_DESTROY_SLEEP:-}" ]; then\n'
     '    : > "$CALL_LOG.destroying"; PATH=/usr/bin:/bin sleep "$FAKE_DESTROY_SLEEP"\n'
     '  fi\n'
@@ -692,18 +703,21 @@ def _wait_for(predicate, proc, what: str, timeout: float = 30) -> None:
 
 
 def _signalled_build(tmp_path: Path, sigs, *, log_reader_dead: bool, group: bool,
-                     during_destroy=()):
+                     during_destroy=(), env_extra=None, ready=None):
     """Start a build in its own process group, as a launcher running it in the
     background would, and send `sigs` once setup is running on the build VM.
     log_reader_dead: stderr is a pipe whose only reader is gone before the
     signal (a killed `tee`). group: each signal goes to the whole process group,
     so it also reaches the in-flight setup `ssh`. during_destroy: signals sent
-    to the group while the trap's destroy is running.
-    Returns (exit code, CALL_LOG text, stderr text or None)."""
+    to the group while the trap's destroy is running. env_extra: more
+    environment. ready: a file (next to CALL_LOG) to wait for as well.
+    Returns (exit code, CALL_LOG text, stderr text or None, seconds from the
+    first signal to the exit)."""
     env, recipe = _build_env(tmp_path)
     env["FAKE_SSH_SLEEP_ON"] = "setup.sh"
     if during_destroy:
         env["FAKE_DESTROY_SLEEP"] = "2"
+    env.update(env_extra or {})
     cloud = tmp_path / "bin" / "fake-cloud"
     cloud.write_text(cloud.read_text() + FAKE_CLOUD_DESTROY)
     err_path = tmp_path / "stderr.txt"
@@ -715,8 +729,11 @@ def _signalled_build(tmp_path: Path, sigs, *, log_reader_dead: bool, group: bool
     try:
         _wait_for(lambda: "setup.sh" in "".join(_remote_commands(_calls(tmp_path))),
                   proc, "setup started")
+        if ready:
+            _wait_for(Path(env["CALL_LOG"] + ready).exists, proc, ready)
         if log_reader_dead:
             proc.stderr.close()
+        signalled = time.time()
         for sig in sigs:
             if group:
                 os.killpg(proc.pid, sig)
@@ -728,12 +745,29 @@ def _signalled_build(tmp_path: Path, sigs, *, log_reader_dead: bool, group: bool
             for sig in during_destroy:
                 os.killpg(proc.pid, sig)
         rc = proc.wait(timeout=30)
+        elapsed = time.time() - signalled
     finally:
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGKILL)
         if err_file:
             err_file.close()
-    return rc, _calls(tmp_path), None if log_reader_dead else err_path.read_text()
+    return rc, _calls(tmp_path), None if log_reader_dead else err_path.read_text(), elapsed
+
+
+def _alive(pid_file: Path) -> bool:
+    """Whether the process whose PID the file holds is still running (a zombie
+    is not)."""
+    pid = int(pid_file.read_text())
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except FileNotFoundError:
+            return False
+        if state == "Z":
+            return False
+        time.sleep(0.05)
+    return True
 
 
 def _assert_destroyed_once(tmp_path: Path, calls: str) -> None:
@@ -752,7 +786,7 @@ def _assert_destroyed_once(tmp_path: Path, calls: str) -> None:
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP],
                          ids=["TERM", "INT", "HUP"])
 def test_signal_during_setup_destroys_once(tmp_path, sig):
-    rc, calls, stderr = _signalled_build(tmp_path, [sig], log_reader_dead=False, group=False)
+    rc, calls, stderr, _ = _signalled_build(tmp_path, [sig], log_reader_dead=False, group=False)
     assert rc == SIGNAL_RC[sig], stderr
     _assert_destroyed_once(tmp_path, calls)
     assert "destroying build VM vm-ib-" in stderr
@@ -764,7 +798,7 @@ def test_signal_during_setup_destroys_once(tmp_path, sig):
 def test_signal_with_log_reader_dead_destroys_once(tmp_path, sig):
     # The signal reached the whole process group: the in-flight setup ssh, and
     # the reader of the builder's stderr (gone before the trap writes a line).
-    rc, calls, _ = _signalled_build(tmp_path, [sig], log_reader_dead=True, group=True)
+    rc, calls, _, _ = _signalled_build(tmp_path, [sig], log_reader_dead=True, group=True)
     assert rc == SIGNAL_RC[sig]
     _assert_destroyed_once(tmp_path, calls)
 
@@ -772,7 +806,7 @@ def test_signal_with_log_reader_dead_destroys_once(tmp_path, sig):
 def test_signals_during_the_trap_do_not_stop_the_destroy(tmp_path):
     # A second TERM (and an INT and a HUP) while the trap's destroy runs: the
     # destroy still finishes, it runs once, and the exit is the first signal's.
-    rc, calls, _ = _signalled_build(
+    rc, calls, _, _ = _signalled_build(
         tmp_path, [signal.SIGTERM], log_reader_dead=True, group=True,
         during_destroy=[signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
     assert rc == 143
@@ -790,6 +824,52 @@ def test_failed_setup_destroys_once(tmp_path):
     _assert_destroyed_once(tmp_path, _calls(tmp_path))
     assert "destroying build VM vm-ib-" in result.stderr
     assert "FAILED during setup pass 1/1 (exit 1); no image was recorded" in result.stderr
+
+
+def test_term_ignoring_command_is_killed_within_the_bound(tmp_path):
+    # The in-flight setup ssh ignores TERM (the signal reached the whole group,
+    # and the trap sends its own): after IMAGE_BUILD_CHILD_STOP_SECONDS it is
+    # KILLed, and the destroy and the cleanup still run.
+    rc, calls, stderr, elapsed = _signalled_build(
+        tmp_path, [signal.SIGTERM], log_reader_dead=False, group=True, ready=".stubborn",
+        env_extra={"FAKE_SSH_SLEEP_ON": "@none@", "FAKE_SSH_STUBBORN_ON": "setup.sh",
+                   "IMAGE_BUILD_CHILD_STOP_SECONDS": "2"})
+    assert rc == 143, stderr
+    assert 1 <= elapsed < 15, elapsed
+    assert not _alive(tmp_path / "calls.log.stubborn")
+    assert "the running command ignored TERM for 2s; killed it" in stderr
+    _assert_destroyed_once(tmp_path, calls)
+
+
+def test_hung_destroy_is_killed_and_named(tmp_path):
+    # A destroy that hangs is killed after IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS.
+    # The trap names the backend and the VM to destroy by hand, the run's key
+    # and payload were already gone when the destroy started, and the exit is
+    # still the signal's.
+    rc, calls, stderr, elapsed = _signalled_build(
+        tmp_path, [signal.SIGTERM], log_reader_dead=False, group=False,
+        env_extra={"FAKE_DESTROY_HANG": "1", "IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS": "2"})
+    assert rc == 143, stderr
+    assert 1 <= elapsed < 15, elapsed
+    assert not _alive(tmp_path / "calls.log.hung")
+    run_id = re.search(r"run (ib-\d{12}-[0-9a-f]{16})", stderr).group(1)
+    assert ("ERROR: the destroy did not finish within 2s and was killed. "
+            f"Destroy it by hand: fake build VM vm-{run_id}") in stderr
+    assert "FAILED during setup pass 1/1 (exit 143)" in stderr
+    assert not (tmp_path / "calls.log.destroyed").exists()
+    assert (tmp_path / "calls.log.tmp-at-destroy").read_text() == ""
+    assert list((tmp_path / "tmp").iterdir()) == []
+
+
+def test_cleanup_bounds_must_be_positive_integers(tmp_path):
+    for key in ("IMAGE_BUILD_CHILD_STOP_SECONDS", "IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS"):
+        for value in ("0", "x", "-5", "08"):
+            env, recipe = _build_env(tmp_path / f"{key}{value}")
+            env[key] = value
+            result = _build(env, "--dry-run", recipe, "fake")
+            assert result.returncode == 2, (key, value, result.stderr)
+            assert key in result.stderr, (key, value)
+            assert "backend_" not in _calls(tmp_path / f"{key}{value}")
 
 
 def test_dirty_tree_refused(tmp_path):

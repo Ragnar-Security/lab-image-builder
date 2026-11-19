@@ -105,6 +105,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shell's default handling ran the trap but died of the signal, so the exit
   code did not say what stopped the build.
 
+- The exit trap can no longer hang. The in-flight command gets TERM, then
+  KILL after `IMAGE_BUILD_CHILD_STOP_SECONDS` (default 20). The run's
+  temporary directory (build key, `payload.tgz`) is removed before the
+  destroy, so a stuck destroy cannot leave it behind. The destroy is KILLed
+  after `IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS` (default 900), and the trap then
+  names the backend and the build VM to destroy by hand. Before, a command
+  or destroy that never returned left the builder stoppable only by SIGKILL,
+  which also left the build key on disk.
+
 - A Windows build on a Proxmox clone of `base-ws2022` no longer fails at the
   payload upload when `sshd` answers once at first boot and then drops the
   next connection (exit 255 or a banner-exchange timeout, measured two or

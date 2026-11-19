@@ -54,6 +54,11 @@
 #                             after each setup pass or reboot, and how long
 #                             the upload may retry exit 255 (default 900).
 #   IMAGE_BUILD_BACKENDS_DIR  where <backend>.sh lives (default: ./backends).
+#   IMAGE_BUILD_CHILD_STOP_SECONDS  after a signal or a failure, how long the
+#                             running command gets after TERM before KILL
+#                             (default 20).
+#   IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS  how long the exit trap's destroy may
+#                             run before it is killed (default 900).
 #
 # Setup contract: exit 0 when done; exit 100 when done but the VM needs a
 # reboot (never reboot from the script). Any other code fails the build. An
@@ -125,6 +130,10 @@ SSH_POLL_SECONDS=10
 SSH_STABLE_PROBES=3
 # A setup's exit code asking the core to reboot the VM.
 SETUP_REBOOT_RC=100
+# How long the cleanup waits for the in-flight command after TERM before it
+# KILLs it, and how long it lets backend_destroy run before it KILLs that.
+CHILD_STOP_SECONDS="${IMAGE_BUILD_CHILD_STOP_SECONDS:-20}"
+DESTROY_TIMEOUT_SECONDS="${IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS:-900}"
 
 DRY_RUN=0
 QUERY_LIVE=0
@@ -572,32 +581,76 @@ cleanup_log() {
   log "$@" || exec 2>/dev/null
 }
 
+# Kill process $2 and everything under it with signal $1, children first (a
+# child whose parent is gone can no longer be found).
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$2" 2>/dev/null); do
+    kill_tree "$1" "$child"
+  done
+  kill "-$1" "$2" 2>/dev/null
+}
+
+# Wait for background process $1 for at most $2 seconds; past that, a watchdog
+# kills it and everything under it with SIGKILL (it may ignore TERM, as every
+# process the cleanup starts does). Leaves its exit status in BOUNDED_RC, and
+# BOUNDED_TIMED_OUT=1 if the watchdog killed it.
+BOUNDED_RC=0
+BOUNDED_TIMED_OUT=0
+bounded_wait() {
+  local pid="$1" watchdog wrc=0
+  (
+    end=$((SECONDS + $2))
+    while [ "$SECONDS" -lt "$end" ]; do sleep 1; done
+    kill_tree KILL "$pid"
+  ) &
+  watchdog=$!
+  BOUNDED_RC=0
+  wait "$pid" 2>/dev/null || BOUNDED_RC=$?
+  kill_tree KILL "$watchdog"
+  wait "$watchdog" 2>/dev/null || wrc=$?
+  # The watchdog exits 0 only if it reached its deadline.
+  BOUNDED_TIMED_OUT=0
+  if [ "$wrc" -eq 0 ] && [ "$BOUNDED_RC" -ne 0 ]; then
+    BOUNDED_TIMED_OUT=1
+  fi
+}
+
 # The EXIT trap, entered at most once. Further signals are ignored from here
 # on (a tool the destroy runs inherits that), so a second TERM, an INT or a
-# HUP cannot cut the destroy short. The in-flight child is killed and reaped
-# before anything else runs.
+# HUP cannot cut the destroy short; instead every wait here is bounded. In
+# order: the in-flight child gets TERM and, after CHILD_STOP_SECONDS, KILL;
+# the run's temporary directory (build key, payload archive) is removed,
+# whatever happened to the child (no backend_destroy needs it); the destroy
+# runs for at most DESTROY_TIMEOUT_SECONDS.
 cleanup() {
   local rc=$? drc=0
   trap '' INT TERM HUP PIPE
   trap - EXIT
   set +e
   if [ -n "$CHILD_PID" ]; then
-    kill "$CHILD_PID" 2>/dev/null
-    wait "$CHILD_PID" 2>/dev/null
+    kill_tree TERM "$CHILD_PID"
+    bounded_wait "$CHILD_PID" "$CHILD_STOP_SECONDS"
+    [ "$BOUNDED_TIMED_OUT" = 1 ] \
+      && cleanup_log "the running command ignored TERM for ${CHILD_STOP_SECONDS}s; killed it"
     CHILD_PID=""
   fi
+  [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"
   if [ "$STARTED" = 1 ] && [ "$DESTROYED" = 0 ]; then
     cleanup_log "destroying build VM ${BUILD_VM_ID:-(none recorded)}"
-    ( set -e; backend_destroy )
-    drc=$?
+    ( set -e; backend_destroy ) &
+    bounded_wait "$!" "$DESTROY_TIMEOUT_SECONDS"
+    drc=$BOUNDED_RC
     if [ "$drc" -eq 0 ]; then
       DESTROYED=1
+    elif [ "$BOUNDED_TIMED_OUT" = 1 ]; then
+      cleanup_log "ERROR: the destroy did not finish within ${DESTROY_TIMEOUT_SECONDS}s and was killed. Destroy it by hand: $BACKEND build VM ${BUILD_VM_ID:-(none recorded; find it by tag image-build=$RUN_ID)}"
+      [ "$rc" -eq 0 ] && rc=1
     else
       cleanup_log "WARNING: could not destroy build VM ${BUILD_VM_ID:-?}; run: $PROG --reap $BACKEND"
       [ "$rc" -eq 0 ] && rc=1
     fi
   fi
-  [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"
   case "$rc" in
     0|1|2|129|130|143) ;;
     *) rc=1 ;;
@@ -683,6 +736,12 @@ while [ $# -gt 0 ]; do
     *) POSITIONAL+=("$1") ;;
   esac
   shift
+done
+
+for key in CHILD_STOP DESTROY_TIMEOUT; do
+  value="${key}_SECONDS"
+  is_posint "${!value}" \
+    || config_error "IMAGE_BUILD_${key}_SECONDS must be a positive integer (got '${!value}')"
 done
 
 if [ -n "$REAP_BACKEND" ]; then

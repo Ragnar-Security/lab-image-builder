@@ -51,8 +51,9 @@ The trap holds up when the signal also killed the processes around the
 builder:
 
 - It sends TERM to the in-flight child (the setup `ssh`, an upload `scp`)
-  and everything under it, waits up to `IMAGE_BUILD_CHILD_STOP_SECONDS`
-  (default 20), then KILLs whatever is left.
+  and everything under it (found with `pgrep -P`), waits up to
+  `IMAGE_BUILD_CHILD_STOP_SECONDS` (default 20), then KILLs whatever is
+  left. The destroy's process tree is killed the same way at its bound.
 - It removes the run's temporary directory (the build key and
   `payload.tgz`) next, before the destroy: no backend's destroy needs them,
   so they are gone even if the destroy hangs.
@@ -93,7 +94,7 @@ reaped). Everything else, including every `DRY-RUN:` line, goes to stderr.
 |---|---|
 | 0 | Success |
 | 1 | A build or reap failed while running. This includes errors a backend raises after the config passed: a malformed `BASE_AWS`, `BASE_GCP` or `BASE_AZURE`, no image matching the base, a base of the other OS family (Azure), a malformed `AWS_INSTANCE_TYPE`, a bad public key, a VMID outside the Proxmox block, a failed setup, verify or seal, no SSH (or no new boot after a reboot) within `IMAGE_BUILD_SSH_WAIT_SECONDS`, a destroy that was refused. Once the build has begun (base resolution onwards), every failure is 1, even one where a backend or a tool it ran exited 2. |
-| 2 | The core rejected the input before any VM started: bad usage or option, unknown backend, unreadable recipe, a missing or invalid recipe key (`OS_FAMILY`, `KEEP_SSH`, the integer keys including a set `*_DISK_GB` override, `PAYLOAD_DIR`, `SETUP`/`VERIFY`), a missing `BASE_<BACKEND>` key, a recipe key the backend requires (`AZURE_VM_SIZE` on Azure), a recipe outside a git repo, a dirty repo, an invalid `IMAGE_BUILD_TTL_MINUTES`, `IMAGE_BUILD_SSH_WAIT_SECONDS`, `IMAGE_BUILD_CHILD_STOP_SECONDS` or `IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS`, an invalid image name, a config that sets a recipe key, or a config the backend's `backend_check_config` rejects. |
+| 2 | The core rejected the input before any VM started: bad usage or option, no `pgrep` (except in a dry run), unknown backend, unreadable recipe, a missing or invalid recipe key (`OS_FAMILY`, `KEEP_SSH`, the integer keys including a set `*_DISK_GB` override, `PAYLOAD_DIR`, `SETUP`/`VERIFY`), a missing `BASE_<BACKEND>` key, a recipe key the backend requires (`AZURE_VM_SIZE` on Azure), a recipe outside a git repo, a dirty repo, an invalid `IMAGE_BUILD_TTL_MINUTES`, `IMAGE_BUILD_SSH_WAIT_SECONDS`, `IMAGE_BUILD_CHILD_STOP_SECONDS` or `IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS`, an invalid image name, a config that sets a recipe key, or a config the backend's `backend_check_config` rejects. |
 | 129, 130, 143 | Hung up (HUP), interrupted (INT) or terminated (TERM); the trap still ran |
 
 ### Image names and the build log
@@ -150,6 +151,11 @@ recipe sets those.
 | Azure | `AZ_BUILD_SUBNET_ID` | Resource ID of the build subnet, `/subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<subnet>`, in `AZ_SUBSCRIPTION_ID`. Its NSG admits `tcp/22` from the build host only. |
 | Azure | `AZ_GALLERY_RG` | Resource group of the Azure Compute Gallery. |
 | Azure | `AZ_GALLERY` | Name of the gallery (letters, digits, `.` and `_`). |
+
+Every build and every `--reap` needs `pgrep` (procps on Linux; macOS ships
+it). The exit trap uses `pgrep -P` to find everything a stopped command
+started, so the builder refuses to start without it (exit 2); a dry run does
+not need it.
 
 The Proxmox backend needs `python3` on the machine running the build. The AWS
 backend needs the AWS CLI v2 on `PATH`, the GCP backend `gcloud`, and the

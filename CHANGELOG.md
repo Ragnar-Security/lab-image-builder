@@ -105,14 +105,17 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shell's default handling ran the trap but died of the signal, so the exit
   code did not say what stopped the build.
 
-- The exit trap can no longer hang. The in-flight command gets TERM, then
-  KILL after `IMAGE_BUILD_CHILD_STOP_SECONDS` (default 20). The run's
-  temporary directory (build key, `payload.tgz`) is removed before the
-  destroy, so a stuck destroy cannot leave it behind. The destroy is KILLed
-  after `IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS` (default 900), and the trap then
-  names the backend and the build VM to destroy by hand. Before, a command
-  or destroy that never returned left the builder stoppable only by SIGKILL,
-  which also left the build key on disk.
+- The exit trap can no longer hang. The in-flight command and everything it
+  started get TERM, then KILL after `IMAGE_BUILD_CHILD_STOP_SECONDS` (default
+  20). The run's temporary directory (build key, `payload.tgz`) is removed
+  before the destroy, so a stuck destroy cannot leave it behind. The destroy
+  and everything it started are KILLed after
+  `IMAGE_BUILD_DESTROY_TIMEOUT_SECONDS` (default 900), and the trap then names
+  the backend and the build VM to destroy by hand. Before, a command or
+  destroy that never returned left the builder stoppable only by SIGKILL,
+  which also left the build key on disk. The trap finds those processes with
+  `pgrep -P`, so a build or `--reap` now needs `pgrep` and refuses to start
+  without it (exit 2); a dry run does not.
 
 - A Windows build on a Proxmox clone of `base-ws2022` no longer fails at the
   payload upload when `sshd` answers once at first boot and then drops the

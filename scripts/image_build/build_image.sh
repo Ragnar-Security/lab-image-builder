@@ -582,7 +582,8 @@ cleanup_log() {
 }
 
 # Kill process $2 and everything under it with signal $1, children first (a
-# child whose parent is gone can no longer be found).
+# child whose parent is gone can no longer be found). pgrep is checked at
+# startup, before anything is created.
 kill_tree() {
   local child
   for child in $(pgrep -P "$2" 2>/dev/null); do
@@ -743,6 +744,12 @@ for key in CHILD_STOP DESTROY_TIMEOUT; do
   is_posint "${!value}" \
     || config_error "IMAGE_BUILD_${key}_SECONDS must be a positive integer (got '${!value}')"
 done
+
+# The exit trap finds a stopped command's descendants with pgrep -P; without
+# it, they would outlive the build. A dry run starts no command it would stop.
+if [ "$DRY_RUN" = 0 ] && ! command -v pgrep >/dev/null 2>&1; then
+  config_error "pgrep is required (procps on Linux): the exit trap uses it to stop every process a build or reap started"
+fi
 
 if [ -n "$REAP_BACKEND" ]; then
   [ "${#POSITIONAL[@]}" -eq 0 ] && [ "$ALLOW_DIRTY" = 0 ] || usage

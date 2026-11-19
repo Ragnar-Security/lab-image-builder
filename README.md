@@ -64,7 +64,8 @@ pip install pytest==9.0.3
 python -m pytest
 ```
 
-They need Linux (or another POSIX system) with bash, git, tar and python3.
+They need Linux (or another POSIX system) with bash, git, tar, pgrep and
+python3.
 
 ## History
 

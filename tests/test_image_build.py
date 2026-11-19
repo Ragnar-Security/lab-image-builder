@@ -261,9 +261,10 @@ FAKE_SSH = LOG_CALL + (
     # while this command still runs.
     'case "$*" in *"${FAKE_SSH_SLEEP_ON:-@none@}"*) PATH=/usr/bin:/bin exec sleep 30 ;; esac\n'
     # A command that ignores TERM (the sleep inherits the ignore through exec)
-    # and records its PID once it does.
+    # and has a child of its own that ignores it too; it records both PIDs.
     'case "$*" in *"${FAKE_SSH_STUBBORN_ON:-@none@}"*)\n'
-    '  trap "" TERM; echo $$ > "$CALL_LOG.stubborn"; PATH=/usr/bin:/bin exec sleep 60 ;;\n'
+    '  trap "" TERM; PATH=/usr/bin:/bin sleep 60 & echo $! > "$CALL_LOG.stubborn-child"\n'
+    '  echo $$ > "$CALL_LOG.stubborn"; PATH=/usr/bin:/bin exec sleep 60 ;;\n'
     'esac\n'
     "exit 0\n"
 )
@@ -682,8 +683,9 @@ FAKE_CLOUD_DESTROY = (
     'if [ "$1" = destroy ]; then\n'
     '  echo "fake-cloud: destroying $2" >&2 || exit 1\n'
     '  if [ -n "${FAKE_DESTROY_HANG:-}" ]; then\n'
-    '    ls -A "$TMPDIR" > "$CALL_LOG.tmp-at-destroy"; echo $$ > "$CALL_LOG.hung"\n'
-    '    PATH=/usr/bin:/bin exec sleep 60\n'
+    '    ls -A "$TMPDIR" > "$CALL_LOG.tmp-at-destroy"\n'
+    '    PATH=/usr/bin:/bin sleep 60 & echo $! > "$CALL_LOG.hung-child"\n'
+    '    echo $$ > "$CALL_LOG.hung"; PATH=/usr/bin:/bin exec sleep 60\n'
     '  fi\n'
     '  if [ -n "${FAKE_DESTROY_SLEEP:-}" ]; then\n'
     '    : > "$CALL_LOG.destroying"; PATH=/usr/bin:/bin sleep "$FAKE_DESTROY_SLEEP"\n'
@@ -836,7 +838,9 @@ def test_term_ignoring_command_is_killed_within_the_bound(tmp_path):
                    "IMAGE_BUILD_CHILD_STOP_SECONDS": "2"})
     assert rc == 143, stderr
     assert 1 <= elapsed < 15, elapsed
+    # Neither the command nor the child it started outlives the build.
     assert not _alive(tmp_path / "calls.log.stubborn")
+    assert not _alive(tmp_path / "calls.log.stubborn-child")
     assert "the running command ignored TERM for 2s; killed it" in stderr
     _assert_destroyed_once(tmp_path, calls)
 
@@ -852,6 +856,7 @@ def test_hung_destroy_is_killed_and_named(tmp_path):
     assert rc == 143, stderr
     assert 1 <= elapsed < 15, elapsed
     assert not _alive(tmp_path / "calls.log.hung")
+    assert not _alive(tmp_path / "calls.log.hung-child")
     run_id = re.search(r"run (ib-\d{12}-[0-9a-f]{16})", stderr).group(1)
     assert ("ERROR: the destroy did not finish within 2s and was killed. "
             f"Destroy it by hand: fake build VM vm-{run_id}") in stderr
@@ -859,6 +864,29 @@ def test_hung_destroy_is_killed_and_named(tmp_path):
     assert not (tmp_path / "calls.log.destroyed").exists()
     assert (tmp_path / "calls.log.tmp-at-destroy").read_text() == ""
     assert list((tmp_path / "tmp").iterdir()) == []
+
+
+def test_pgrep_required_before_anything_starts(tmp_path):
+    # Without pgrep the trap could not find a stopped command's descendants,
+    # so a build or a reap is refused before it creates or destroys anything.
+    # A dry run needs no pgrep.
+    env, recipe = _build_env(tmp_path)
+    no_pgrep = tmp_path / "no-pgrep"
+    no_pgrep.mkdir()
+    for system_dir in ("/usr/bin", "/bin"):
+        for name in os.listdir(system_dir):
+            target = Path(system_dir) / name
+            if name != "pgrep" and not (no_pgrep / name).exists() and os.access(target, os.X_OK):
+                (no_pgrep / name).symlink_to(target)
+    fakes = env["PATH"].split(":", 1)[0]
+    env["PATH"] = f"{fakes}:{no_pgrep}"
+    for args in ((recipe, "fake"), ("--reap", "fake")):
+        result = _build(env, *args)
+        assert result.returncode == 2, (args, result.stderr)
+        assert "pgrep is required" in result.stderr, args
+        assert "backend_" not in _calls(tmp_path), args
+    result = _build(env, "--dry-run", recipe, "fake")
+    assert result.returncode == 0, result.stderr
 
 
 def test_cleanup_bounds_must_be_positive_integers(tmp_path):

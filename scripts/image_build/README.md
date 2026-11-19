@@ -40,10 +40,33 @@ build_image.sh --reap <backend> [--dry-run]
 9. Append a line to the build log.
 10. Destroy the build VM and print the `templates.yaml` lines.
 
-A trap destroys the build VM on every exit, including an error, Ctrl-C and
-SIGTERM. If the destroy itself fails, the script says so and tells you to run
-`--reap`. Only a build that passed verify and seal is saved, logged and
-printed.
+A trap destroys the build VM on every exit, including an error, Ctrl-C,
+SIGTERM and SIGHUP, in any phase (start, SSH wait, upload, setup, verify,
+seal, save), and then removes the run's temporary directory (the build key
+and `payload.tgz`). If the destroy itself fails, the script says so and tells
+you to run `--reap`. Only a build that passed verify and seal is saved, logged
+and printed.
+
+The trap holds up when the signal also killed the processes around the
+builder:
+
+- It kills and reaps the in-flight child (the setup `ssh`, an upload `scp`)
+  before anything else.
+- It ignores SIGPIPE, and its first log line tells it whether stderr still
+  has a reader. If the signal also killed the reader (a `tee`, or the pipe
+  into a log file), stderr moves to `/dev/null`, so neither the trap nor the
+  destroy it runs dies writing to the dead pipe. Its messages are then lost;
+  the exit code still says the build was stopped.
+- It ignores every further HUP, INT and TERM, and so do the tools the destroy
+  runs, so a second signal (another Ctrl-C, a signal to the whole process
+  group) cannot cut the destroy short. The trap runs once; the destroy is run
+  once.
+
+To stop a build, signal the `build_image.sh` process itself
+(`kill -TERM <pid>`). Whether it shares a process group with whatever launched
+it depends on the launcher, so a signal to the launcher's group may not reach
+it. `kill -9` cannot be trapped: a build stopped that way leaves its build VM
+for `--reap`.
 
 **It does not:** edit `templates.yaml` (it prints lines for you to paste),
 push anything, touch the portal's database, or copy an image between clouds.
@@ -59,7 +82,7 @@ reaped). Everything else, including every `DRY-RUN:` line, goes to stderr.
 | 0 | Success |
 | 1 | A build or reap failed while running. This includes errors a backend raises after the config passed: a malformed `BASE_AWS`, `BASE_GCP` or `BASE_AZURE`, no image matching the base, a base of the other OS family (Azure), a malformed `AWS_INSTANCE_TYPE`, a bad public key, a VMID outside the Proxmox block, a failed setup, verify or seal, no SSH (or no new boot after a reboot) within `IMAGE_BUILD_SSH_WAIT_SECONDS`, a destroy that was refused. Once the build has begun (base resolution onwards), every failure is 1, even one where a backend or a tool it ran exited 2. |
 | 2 | The core rejected the input before any VM started: bad usage or option, unknown backend, unreadable recipe, a missing or invalid recipe key (`OS_FAMILY`, `KEEP_SSH`, the integer keys including a set `*_DISK_GB` override, `PAYLOAD_DIR`, `SETUP`/`VERIFY`), a missing `BASE_<BACKEND>` key, a recipe key the backend requires (`AZURE_VM_SIZE` on Azure), a recipe outside a git repo, a dirty repo, an invalid `IMAGE_BUILD_TTL_MINUTES` or `IMAGE_BUILD_SSH_WAIT_SECONDS`, an invalid image name, a config that sets a recipe key, or a config the backend's `backend_check_config` rejects. |
-| 130, 143 | Interrupted (INT) or terminated (TERM); the trap still ran |
+| 129, 130, 143 | Hung up (HUP), interrupted (INT) or terminated (TERM); the trap still ran |
 
 ### Image names and the build log
 

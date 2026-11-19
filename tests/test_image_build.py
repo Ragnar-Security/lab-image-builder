@@ -12,6 +12,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE_BUILD = ROOT / "scripts" / "image_build"
 SEAL_LINUX = IMAGE_BUILD / "seal_linux.sh"
@@ -665,29 +667,129 @@ def test_config_cannot_touch_core_state_or_recipe_keys(tmp_path):
     assert 'backend_check_config region=a b * "c"' in _calls(tmp_path / "value")
 
 
-def test_sigterm_destroys(tmp_path):
+# A destroy that, like an SSH session relaying the backend's output, fails if
+# it cannot write to its stderr. FAKE_DESTROY_SLEEP makes it take that long,
+# after marking $CALL_LOG.destroying; $CALL_LOG.destroyed gets one line per
+# destroy that ran to the end.
+FAKE_CLOUD_DESTROY = (
+    'if [ "$1" = destroy ]; then\n'
+    '  echo "fake-cloud: destroying $2" >&2 || exit 1\n'
+    '  if [ -n "${FAKE_DESTROY_SLEEP:-}" ]; then\n'
+    '    : > "$CALL_LOG.destroying"; PATH=/usr/bin:/bin sleep "$FAKE_DESTROY_SLEEP"\n'
+    '  fi\n'
+    '  echo "$2" >> "$CALL_LOG.destroyed"\n'
+    'fi\n'
+)
+SIGNAL_RC = {signal.SIGTERM: 143, signal.SIGINT: 130, signal.SIGHUP: 129}
+
+
+def _wait_for(predicate, proc, what: str, timeout: float = 30) -> None:
+    deadline = time.time() + timeout
+    while not predicate():
+        assert proc.poll() is None, f"the build exited (rc {proc.returncode}) before {what}"
+        assert time.time() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.05)
+
+
+def _signalled_build(tmp_path: Path, sigs, *, log_reader_dead: bool, group: bool,
+                     during_destroy=()):
+    """Start a build in its own process group, as a launcher running it in the
+    background would, and send `sigs` once setup is running on the build VM.
+    log_reader_dead: stderr is a pipe whose only reader is gone before the
+    signal (a killed `tee`). group: each signal goes to the whole process group,
+    so it also reaches the in-flight setup `ssh`. during_destroy: signals sent
+    to the group while the trap's destroy is running.
+    Returns (exit code, CALL_LOG text, stderr text or None)."""
     env, recipe = _build_env(tmp_path)
     env["FAKE_SSH_SLEEP_ON"] = "setup.sh"
-    out = (tmp_path / "out.txt").open("w")
+    if during_destroy:
+        env["FAKE_DESTROY_SLEEP"] = "2"
+    cloud = tmp_path / "bin" / "fake-cloud"
+    cloud.write_text(cloud.read_text() + FAKE_CLOUD_DESTROY)
+    err_path = tmp_path / "stderr.txt"
+    err_file = None if log_reader_dead else err_path.open("w")
     proc = subprocess.Popen(["bash", str(BUILD), str(recipe), "fake"], env=env,
-                            stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+                            stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE if log_reader_dead else err_file,
+                            start_new_session=True)
     try:
-        deadline = time.time() + 30
-        while "setup.sh" not in "".join(_remote_commands(_calls(tmp_path))):
-            assert proc.poll() is None, (tmp_path / "out.txt").read_text()
-            assert time.time() < deadline
-            time.sleep(0.1)
-        proc.send_signal(signal.SIGTERM)
-        rc = proc.wait(timeout=20)
+        _wait_for(lambda: "setup.sh" in "".join(_remote_commands(_calls(tmp_path))),
+                  proc, "setup started")
+        if log_reader_dead:
+            proc.stderr.close()
+        for sig in sigs:
+            if group:
+                os.killpg(proc.pid, sig)
+            else:
+                proc.send_signal(sig)
+        if during_destroy:
+            destroying = Path(env["CALL_LOG"] + ".destroying")
+            _wait_for(destroying.exists, proc, "the trap's destroy started")
+            for sig in during_destroy:
+                os.killpg(proc.pid, sig)
+        rc = proc.wait(timeout=30)
     finally:
         if proc.poll() is None:
-            proc.kill()
-        out.close()
-    assert rc != 0
-    steps = _events(_calls(tmp_path), "setup.sh", "verify.sh", "seal_linux.sh")
-    assert steps[-1] == "destroy"
-    assert "save" not in steps
+            os.killpg(proc.pid, signal.SIGKILL)
+        if err_file:
+            err_file.close()
+    return rc, _calls(tmp_path), None if log_reader_dead else err_path.read_text()
+
+
+def _assert_destroyed_once(tmp_path: Path, calls: str) -> None:
+    steps = _events(calls, "setup.sh", "verify.sh", "seal_linux.sh")
+    assert steps[-1] == "destroy", steps
+    assert "save" not in steps and "verify" not in steps, steps
+    assert steps.count("destroy") == 1, steps
+    assert len(_remote_commands(calls, "fake-cloud destroy")) == 1, calls
+    destroyed = tmp_path / "calls.log.destroyed"
+    assert destroyed.exists(), "the build VM's destroy did not run to the end"
+    assert len(destroyed.read_text().splitlines()) == 1
+    # The run's key and payload archive are gone.
     assert list((tmp_path / "tmp").iterdir()) == []
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP],
+                         ids=["TERM", "INT", "HUP"])
+def test_signal_during_setup_destroys_once(tmp_path, sig):
+    rc, calls, stderr = _signalled_build(tmp_path, [sig], log_reader_dead=False, group=False)
+    assert rc == SIGNAL_RC[sig], stderr
+    _assert_destroyed_once(tmp_path, calls)
+    assert "destroying build VM vm-ib-" in stderr
+    assert "FAILED during setup pass 1/1" in stderr
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP],
+                         ids=["TERM", "INT", "HUP"])
+def test_signal_with_log_reader_dead_destroys_once(tmp_path, sig):
+    # The signal reached the whole process group: the in-flight setup ssh, and
+    # the reader of the builder's stderr (gone before the trap writes a line).
+    rc, calls, _ = _signalled_build(tmp_path, [sig], log_reader_dead=True, group=True)
+    assert rc == SIGNAL_RC[sig]
+    _assert_destroyed_once(tmp_path, calls)
+
+
+def test_signals_during_the_trap_do_not_stop_the_destroy(tmp_path):
+    # A second TERM (and an INT and a HUP) while the trap's destroy runs: the
+    # destroy still finishes, it runs once, and the exit is the first signal's.
+    rc, calls, _ = _signalled_build(
+        tmp_path, [signal.SIGTERM], log_reader_dead=True, group=True,
+        during_destroy=[signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+    assert rc == 143
+    _assert_destroyed_once(tmp_path, calls)
+
+
+def test_failed_setup_destroys_once(tmp_path):
+    # The ordinary failure path: no signal, exit 1, one destroy.
+    env, recipe = _build_env(tmp_path)
+    _fail(env, "ssh", "setup.sh", 1)
+    cloud = tmp_path / "bin" / "fake-cloud"
+    cloud.write_text(cloud.read_text() + FAKE_CLOUD_DESTROY)
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 1, result.stderr
+    _assert_destroyed_once(tmp_path, _calls(tmp_path))
+    assert "destroying build VM vm-ib-" in result.stderr
+    assert "FAILED during setup pass 1/1 (exit 1); no image was recorded" in result.stderr
 
 
 def test_dirty_tree_refused(tmp_path):

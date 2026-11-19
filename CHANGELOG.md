@@ -94,6 +94,17 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A build stopped by SIGTERM no longer leaves its build VM running when the
+  signal also killed the reader of the builder's stderr (a `tee` into a log)
+  and the in-flight setup `ssh`. The trap's first log line hit the dead pipe,
+  SIGPIPE killed the shell, and the destroy never ran. The trap now ignores
+  SIGPIPE and moves stderr to `/dev/null` once a write fails. It kills and
+  reaps the in-flight child first, and it ignores further HUP, INT and TERM
+  from the moment a signal arrives, so a second signal cannot interrupt the
+  destroy. SIGHUP is now trapped like INT and TERM and exits 129. Before, the
+  shell's default handling ran the trap but died of the signal, so the exit
+  code did not say what stopped the build.
+
 - A Windows build on a Proxmox clone of `base-ws2022` no longer fails at the
   payload upload when `sshd` answers once at first boot and then drops the
   next connection (exit 255 or a banner-exchange timeout, measured two or

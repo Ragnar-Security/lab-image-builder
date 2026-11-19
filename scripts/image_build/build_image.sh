@@ -6,7 +6,8 @@
 #   build_image.sh --reap <backend> [--dry-run]
 #
 # Exit codes: 0 success, 2 usage or config error (only before the build
-# started: past that, any failure is 1), 1 build failure.
+# started: past that, any failure is 1), 1 build failure, 129/130/143 stopped
+# by HUP/INT/TERM.
 #
 # A build: start a build VM from the backend's base, wait until SSH answers
 # several times in a row, upload the recipe's payload over SSH (each upload
@@ -16,7 +17,8 @@
 # boot ID), run verify,
 # seal (the matching seal script from this directory), save the image,
 # destroy the build VM. A trap destroys the build VM
-# on every exit, so a failed or interrupted build leaves nothing running. Only a
+# on every exit, so a failed or interrupted build leaves nothing running, even
+# when the signal also killed the reader of stderr (see cleanup). Only a
 # verified, sealed build is saved, logged and printed.
 #
 # --dry-run prints every command that would reach a VM or a cloud ("DRY-RUN:"
@@ -560,9 +562,23 @@ remote_seal() {
 
 # --- cleanup -----------------------------------------------------------------
 
+# A line from the cleanup. The signal that stopped the build may also have
+# killed whatever reads stderr (a `tee`, a pipe into a log). SIGPIPE is
+# ignored in the cleanup, so a write to that pipe fails instead of killing the
+# shell; stderr then moves to /dev/null, so the destroy and every tool it runs
+# (an SSH session relaying a remote command's output) write nowhere instead of
+# failing on the dead pipe.
+cleanup_log() {
+  log "$@" || exec 2>/dev/null
+}
+
+# The EXIT trap, entered at most once. Further signals are ignored from here
+# on (a tool the destroy runs inherits that), so a second TERM, an INT or a
+# HUP cannot cut the destroy short. The in-flight child is killed and reaped
+# before anything else runs.
 cleanup() {
   local rc=$? drc=0
-  trap '' INT TERM
+  trap '' INT TERM HUP PIPE
   trap - EXIT
   set +e
   if [ -n "$CHILD_PID" ]; then
@@ -571,17 +587,19 @@ cleanup() {
     CHILD_PID=""
   fi
   if [ "$STARTED" = 1 ] && [ "$DESTROYED" = 0 ]; then
-    log "destroying build VM ${BUILD_VM_ID:-(none recorded)}"
+    cleanup_log "destroying build VM ${BUILD_VM_ID:-(none recorded)}"
     ( set -e; backend_destroy )
     drc=$?
-    if [ "$drc" -ne 0 ]; then
-      log "WARNING: could not destroy build VM ${BUILD_VM_ID:-?}; run: $PROG --reap $BACKEND"
+    if [ "$drc" -eq 0 ]; then
+      DESTROYED=1
+    else
+      cleanup_log "WARNING: could not destroy build VM ${BUILD_VM_ID:-?}; run: $PROG --reap $BACKEND"
       [ "$rc" -eq 0 ] && rc=1
     fi
   fi
   [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"
   case "$rc" in
-    0|1|2|130|143) ;;
+    0|1|2|129|130|143) ;;
     *) rc=1 ;;
   esac
   # 2 means the core rejected the input before the build began. Past that, a
@@ -591,12 +609,19 @@ cleanup() {
   fi
   if [ "$rc" -ne 0 ] && [ "$STEP" != startup ]; then
     if [ "$LOGGED" = 1 ]; then
-      log "FAILED during $STEP (exit $rc), after image $IMAGE_ID was saved and logged"
+      cleanup_log "FAILED during $STEP (exit $rc), after image $IMAGE_ID was saved and logged"
     else
-      log "FAILED during $STEP (exit $rc); no image was recorded"
+      cleanup_log "FAILED during $STEP (exit $rc); no image was recorded"
     fi
   fi
   exit "$rc"
+}
+
+# HUP, INT or TERM: ignore every further signal at once, before the EXIT trap
+# is entered, then exit through it.
+on_signal() {
+  trap '' INT TERM HUP PIPE
+  exit "$1"
 }
 
 # --- reap ----------------------------------------------------------------------
@@ -636,8 +661,9 @@ reap() {
 # The trap is in place before anything can fail, so every exit (including a
 # signal) destroys whatever was started and maps stray codes to 1.
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 # --- arguments -----------------------------------------------------------------
 

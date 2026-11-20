@@ -232,13 +232,15 @@ BASE_RECIPE = {
 # FAKE_SSH_FAIL_ON fails every matching call with FAKE_SSH_FAIL_RC, or only
 # the first FAKE_SSH_FAIL_TIMES of them. FAKE_SSH_PROBES lists the exit codes
 # of successive readiness probes (`exit 0`); its last code repeats. The first
-# FAKE_BOOT_FAIL_TIMES boot-ID reads fail, as WMI does on a Windows VM that
-# answers SSH before it is ready. FAKE_BOOT_HANG makes every boot-ID read hang.
+# FAKE_BOOT_FAIL_TIMES boot-ID reads fail, as on a Windows VM that answers SSH
+# before the read works. FAKE_BOOT_HANG makes every boot-ID read hang.
+# FAKE_CLOCK_STEPS makes a LastBootUpTime read print a new value every time
+# within one boot, as it did on a Windows domain controller build.
 FAKE_SSH = LOG_CALL + (
     'for a in "$@"; do last="$a"; done; printf "%s\\0" "$last" >> "$CALL_LOG.remote"\n'
     'boot="$CALL_LOG.boot"; pending="$CALL_LOG.reboot-pending"\n'
     '[ -f "$boot" ] || echo 1 > "$boot"\n'
-    'case "$last" in *boot_id*|*LastBootUpTime*)\n'
+    'case "$last" in *boot_id*|*StartTime*|*LastBootUpTime*)\n'
     '  if [ -f "$pending" ]; then\n'
     '    n=$(cat "$pending")\n'
     '    if [ "$n" -le 0 ]; then echo $(( $(cat "$boot") + 1 )) > "$boot"; rm -f "$pending"\n'
@@ -249,12 +251,18 @@ FAKE_SSH = LOG_CALL + (
     'case "$last" in *"systemctl reboot"*|*Restart-Computer*|*"${FAKE_SSH_REBOOT_ON:-@none@}"*)\n'
     '  echo "${FAKE_BOOT_FLIP_AFTER:-0}" > "$pending" ;;\n'
     'esac\n'
-    'case "$last" in *boot_id*|*LastBootUpTime*)\n'
+    'case "$last" in *boot_id*|*StartTime*|*LastBootUpTime*)\n'
     '  [ -z "${FAKE_BOOT_HANG:-}" ] || PATH=/usr/bin:/bin exec sleep 30\n'
     '  c="$CALL_LOG.boot-fails"; n=$(cat "$c" 2>/dev/null || echo 0)\n'
     '  if [ "$n" -lt "${FAKE_BOOT_FAIL_TIMES:-0}" ]; then\n'
-    '    echo $((n + 1)) > "$c"; echo "Get-CimInstance : Call was canceled." >&2; exit 1\n'
+    '    echo $((n + 1)) > "$c"; echo "the boot-ID read failed" >&2; exit 1\n'
     '  fi\n'
+    '  case "$last" in *LastBootUpTime*)\n'
+    '    if [ -n "${FAKE_CLOCK_STEPS:-}" ]; then\n'
+    '      c="$CALL_LOG.clock-steps"; n=$(( $(cat "$c" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$c"\n'
+    '      echo "boot-$(cat "$boot").$n"; exit 0\n'
+    '    fi ;;\n'
+    '  esac\n'
     '  echo "boot-$(cat "$boot")"; exit 0 ;;\n'
     'esac\n'
     'if [ "$last" = "exit 0" ] && [ -n "${FAKE_SSH_PROBES:-}" ]; then\n'
@@ -512,7 +520,7 @@ def _timeline(tmp_path: Path) -> list:
 
 
 def _is_boot_read(command: str) -> bool:
-    return "boot_id" in command or "LastBootUpTime" in command
+    return any(s in command for s in ("boot_id", "StartTime", "LastBootUpTime"))
 
 
 def test_setup_exit_100_core_reboots_and_waits_for_new_boot(tmp_path):
@@ -572,6 +580,40 @@ def test_setup_session_drop_requires_a_new_boot(tmp_path):
     result = _build(env2, recipe2, "fake")
     assert result.returncode == 1
     steps = _events(_calls(tmp_path / "fail"), "setup.sh", "verify.sh", "seal_linux.sh")
+    assert "verify" not in steps and "save" not in steps
+    assert steps[-1] == "destroy"
+
+
+def test_windows_boot_id_holds_when_last_boot_time_moves(tmp_path):
+    # The VM's LastBootUpTime moves on every read within one boot, as it did on
+    # a domain controller build, where a change read just after the reboot
+    # command was taken for a reboot. The boot ID the builder reads must stay
+    # the same until the VM really reboots.
+    env, recipe = _build_env(tmp_path / "reboot", "windows")
+    _fast_sleep(tmp_path / "reboot")
+    env.update(FAKE_SSH_FAIL_ON="setup.ps1", FAKE_SSH_FAIL_RC="100", FAKE_BOOT_FLIP_AFTER="3",
+               FAKE_CLOCK_STEPS="1")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    timeline = _timeline(tmp_path / "reboot")
+    commands = [c for _b, c in timeline]
+    i_reboot = next(i for i, c in enumerate(commands) if "Restart-Computer -Force" in c)
+    i_verify = next(i for i, c in enumerate(commands) if "verify.ps1" in c)
+    assert timeline[i_verify][0] == "boot-2", timeline
+    polls = [b for b, c in timeline[i_reboot + 1:i_verify] if _is_boot_read(c)]
+    assert polls[:3] == ["boot-1"] * 3, timeline
+    assert "the VM rebooted (boot ID boot-1 -> boot-2)" in result.stderr
+
+    # The session drops without a reboot: an unchanged boot ID is no reboot,
+    # so the build stops when the wait runs out.
+    env, recipe = _build_env(tmp_path / "same", "windows")
+    _fast_sleep(tmp_path / "same")
+    env.update(FAKE_SSH_FAIL_ON="setup.ps1", FAKE_SSH_FAIL_RC="255", FAKE_CLOCK_STEPS="1",
+               IMAGE_BUILD_SSH_WAIT_SECONDS="2")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 1, result.stderr
+    assert "SSH dropped during setup but the VM did not reboot" in result.stderr
+    steps = _events(_calls(tmp_path / "same"), "setup.ps1", "verify.ps1", "seal_windows.ps1")
     assert "verify" not in steps and "save" not in steps
     assert steps[-1] == "destroy"
 

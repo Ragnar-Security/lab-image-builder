@@ -473,13 +473,21 @@ wait_ssh() {
 }
 
 # The command that prints the build VM's boot identity, which changes on
-# every boot and only then: Linux's boot_id, Windows' last boot time (UTC, to
-# the second, so it reads the same on every call within one boot).
+# every boot and only then: Linux's boot_id; on Windows, the creation time of
+# the System process (PID 4) as a UTC FILETIME. The kernel records it once,
+# when it starts, and nothing rewrites it. Measured on Windows Server 2022,
+# unpatched and fully updated: the same value through clock steps of 90 s and
+# an hour, a clock slewed 20-30 s fast, time zone changes and the shutdown
+# after Restart-Computer; a new value after every reboot; readable at the
+# first SSH answer of a boot. Get-Process needs neither WMI nor the event log,
+# which a setup may clear. LastBootUpTime is no boot identity: on a domain
+# controller build it read one second later right after the reboot command,
+# in the boot that was going down, and the build took that for the reboot.
 boot_id_command() {
   if [ "$OS_FAMILY" = linux ]; then
     printf '%s' 'cat /proc/sys/kernel/random/boot_id'
   else
-    printf '%s' "powershell -NoProfile -ExecutionPolicy Bypass -Command \"(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('yyyyMMddHHmmss')\""
+    printf '%s' 'powershell -NoProfile -ExecutionPolicy Bypass -Command "(Get-Process -Id 4).StartTime.ToFileTimeUtc()"'
   fi
 }
 
@@ -487,7 +495,7 @@ boot_id_command() {
 # word. The SSH runs through run_bg with its output in a file, not in a
 # command substitution. Bash runs a trap only after a command substitution
 # finishes, so a signal sent to the builder alone would otherwise wait for a
-# hung WMI query.
+# hung read.
 read_boot_id() {
   local out="$TMP_DIR/boot-id"
   BOOT_ID=""
@@ -500,10 +508,10 @@ read_boot_id() {
 
 # Set BOOT_ID to the boot ID, retrying SSH_POLL_SECONDS apart until
 # SSH_WAIT_SECONDS have passed. SSH answering is not enough. Measured on a
-# Windows Server 2022 build: right after the reboot that follows updates, SSH
-# answered 3 times in a row and the next boot-ID read failed, because WMI was
-# not ready yet. Each attempt and each sleep runs in this shell, so a signal
-# is handled while either is in flight.
+# Windows Server 2022 build, when the boot ID still came from WMI: right after
+# the reboot that follows updates, SSH answered 3 times in a row and the next
+# boot-ID read failed, because WMI was not ready yet. Each attempt and each
+# sleep runs in this shell, so a signal is handled while either is in flight.
 read_boot_id_waiting() {
   local deadline=$((SECONDS + SSH_WAIT_SECONDS)) attempt=1
   until read_boot_id; do

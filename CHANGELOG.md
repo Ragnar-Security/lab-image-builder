@@ -130,3 +130,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and seal are never retried. The extract no longer deletes the archive itself,
   so a retried extract still finds it. Builds no longer need an operator's
   `ssh`/`scp` retry wrapper.
+
+- A Windows setup pass that asks for a reboot no longer lets the next pass
+  start in the boot that is going down. The Windows boot ID was
+  `LastBootUpTime`, which on a domain controller build read one second later
+  right after the reboot command, before the VM went down, and the builder
+  took the change for the reboot. The boot ID is now the creation time of the
+  System process (PID 4), which no clock step, slew or time zone change moved
+  on Windows Server 2022, and which is read with `Get-Process`, without WMI or
+  the event log.

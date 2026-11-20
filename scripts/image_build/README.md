@@ -231,9 +231,10 @@ Windows. Setup and verify run as root (Linux, through `sudo`) or in PowerShell
   started in the background so the SSH call returns; on Azure the backend's
   `backend_reboot` runs `az vm restart` instead), then waits until SSH
   answers with a boot ID other than the one it recorded before the setup ran
-  (Linux `/proc/sys/kernel/random/boot_id`; Windows the last boot time, UTC,
-  to the second). Only then does the next pass or verify run, so nothing runs
-  against a VM that is still on its way down. No new boot within
+  (Linux `/proc/sys/kernel/random/boot_id`; Windows the creation time of the
+  System process, PID 4, which no clock change moves). Only then does the
+  next pass or verify run, so nothing runs against a VM that is still on its
+  way down. No new boot within
   `IMAGE_BUILD_SSH_WAIT_SECONDS` fails the build. Any other exit code fails
   the build.
 - **A dropped session must have been a reboot.** If the setup's SSH session

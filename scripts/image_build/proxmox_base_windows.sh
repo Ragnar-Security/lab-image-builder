@@ -231,10 +231,10 @@ wait_agent() {
 # PowerShell that prints this boot's identity: the record ID of the newest
 # "operating system started" event (Kernel-General 12) in the System log.
 # Each boot writes one and normal log rotation keeps record IDs growing, so
-# any change is a reboot (LastBootUpTime is not: it moves when the clock is
-# stepped, and a fast reboot can land within the same minute). The one
-# exception is finalize.ps1, which clears the System log; it must stay the
-# last step, because no step after it may rely on BOOT_PS.
+# any change is a reboot (LastBootUpTime is not: it changed within one boot
+# on an image build, and a fast reboot can land within the same minute). The
+# one exception is finalize.ps1, which clears the System log; it must stay
+# the last step, because no step after it may rely on BOOT_PS.
 BOOT_PS="[string](Get-WinEvent -MaxEvents 1 -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-General'; Id=12}).RecordId"
 
 # Wait until the guest has settled after a boot: Windows servicing
@@ -547,8 +547,7 @@ unset INSTALL_PASSWORD
 VM_ARMED="$APPLY"
 # The RTC in UTC (Proxmox's default for Windows is the node's local time):
 # Windows runs in UTC here, so it boots with the right clock instead of
-# stepping it at the first time sync. A step moves LastBootUpTime, the
-# image builder's Windows boot ID.
+# stepping it at the first time sync.
 run qm create "$VMID" --name "$NAME" --ostype win11 --localtime 0 --cores "$BUILD_CORES" --memory "$BUILD_MEMORY" \
     --agent enabled=1 --scsihw virtio-scsi-single --scsi0 "$PVE_STORAGE:$DISK_GIB,discard=on" \
     --ide2 "$ISO,media=cdrom" --ide0 "$VIRTIO_ISO,media=cdrom" --ide3 "$GEN_ISO,media=cdrom" \

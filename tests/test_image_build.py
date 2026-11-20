@@ -233,7 +233,7 @@ BASE_RECIPE = {
 # the first FAKE_SSH_FAIL_TIMES of them. FAKE_SSH_PROBES lists the exit codes
 # of successive readiness probes (`exit 0`); its last code repeats. The first
 # FAKE_BOOT_FAIL_TIMES boot-ID reads fail, as WMI does on a Windows VM that
-# answers SSH before it is ready.
+# answers SSH before it is ready. FAKE_BOOT_HANG makes every boot-ID read hang.
 FAKE_SSH = LOG_CALL + (
     'for a in "$@"; do last="$a"; done; printf "%s\\0" "$last" >> "$CALL_LOG.remote"\n'
     'boot="$CALL_LOG.boot"; pending="$CALL_LOG.reboot-pending"\n'
@@ -250,6 +250,7 @@ FAKE_SSH = LOG_CALL + (
     '  echo "${FAKE_BOOT_FLIP_AFTER:-0}" > "$pending" ;;\n'
     'esac\n'
     'case "$last" in *boot_id*|*LastBootUpTime*)\n'
+    '  [ -z "${FAKE_BOOT_HANG:-}" ] || PATH=/usr/bin:/bin exec sleep 30\n'
     '  c="$CALL_LOG.boot-fails"; n=$(cat "$c" 2>/dev/null || echo 0)\n'
     '  if [ "$n" -lt "${FAKE_BOOT_FAIL_TIMES:-0}" ]; then\n'
     '    echo $((n + 1)) > "$c"; echo "Get-CimInstance : Call was canceled." >&2; exit 1\n'
@@ -742,7 +743,7 @@ def _wait_for(predicate, proc, what: str, timeout: float = 30) -> None:
 
 
 def _signalled_build(tmp_path: Path, sigs, *, log_reader_dead: bool, group: bool,
-                     during_destroy=(), env_extra=None, ready=None):
+                     during_destroy=(), env_extra=None, ready=None, started="setup.sh"):
     """Start a build in its own process group, as a launcher running it in the
     background would, and send `sigs` once setup is running on the build VM.
     log_reader_dead: stderr is a pipe whose only reader is gone before the
@@ -750,6 +751,7 @@ def _signalled_build(tmp_path: Path, sigs, *, log_reader_dead: bool, group: bool
     so it also reaches the in-flight setup `ssh`. during_destroy: signals sent
     to the group while the trap's destroy is running. env_extra: more
     environment. ready: a file (next to CALL_LOG) to wait for as well.
+    started: the remote command that must be in flight before the signal.
     Returns (exit code, CALL_LOG text, stderr text or None, seconds from the
     first signal to the exit)."""
     env, recipe = _build_env(tmp_path)
@@ -766,8 +768,8 @@ def _signalled_build(tmp_path: Path, sigs, *, log_reader_dead: bool, group: bool
                             stderr=subprocess.PIPE if log_reader_dead else err_file,
                             start_new_session=True)
     try:
-        _wait_for(lambda: "setup.sh" in "".join(_remote_commands(_calls(tmp_path))),
-                  proc, "setup started")
+        _wait_for(lambda: started in "".join(_remote_commands(_calls(tmp_path))),
+                  proc, f"{started} started")
         if ready:
             _wait_for(Path(env["CALL_LOG"] + ready).exists, proc, ready)
         if log_reader_dead:
@@ -879,6 +881,19 @@ def test_term_ignoring_command_is_killed_within_the_bound(tmp_path):
     assert not _alive(tmp_path / "calls.log.stubborn")
     assert not _alive(tmp_path / "calls.log.stubborn-child")
     assert "the running command ignored TERM for 2s; killed it" in stderr
+    _assert_destroyed_once(tmp_path, calls)
+
+
+def test_signal_during_a_hung_boot_id_read_destroys_within_the_bound(tmp_path):
+    # The boot-ID read before setup hangs (WMI never answers), and TERM reaches
+    # only the builder, not the ssh. The read runs through run_bg, so the trap
+    # runs at once instead of after the 30 s hang.
+    rc, calls, stderr, elapsed = _signalled_build(
+        tmp_path, [signal.SIGTERM], log_reader_dead=False, group=False, started="boot_id",
+        env_extra={"FAKE_BOOT_HANG": "1"})
+    assert rc == 143, stderr
+    assert elapsed < 15, elapsed
+    assert "FAILED during setup pass 1/1 (exit 143)" in stderr
     _assert_destroyed_once(tmp_path, calls)
 
 

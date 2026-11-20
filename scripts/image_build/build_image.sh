@@ -483,25 +483,30 @@ boot_id_command() {
   fi
 }
 
-# Print the boot ID; non-zero if SSH fails or the answer is not one word.
+# Set BOOT_ID to the boot ID; non-zero if SSH fails or the answer is not one
+# word. The SSH runs through run_bg with its output in a file, not in a
+# command substitution. Bash runs a trap only after a command substitution
+# finishes, so a signal sent to the builder alone would otherwise wait for a
+# hung WMI query.
 read_boot_id() {
-  local out
-  out="$(query boot-id-dry-run ssh -n "${SSH_OPTS[@]}" -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT" "$SSH_TARGET" \
-    "$(boot_id_command)")" || return
-  out="${out//$'\r'/}"
-  [[ "$out" =~ ^[A-Za-z0-9.:-]+$ ]] || return 1
-  printf '%s\n' "$out"
+  local out="$TMP_DIR/boot-id"
+  BOOT_ID=""
+  run_bg query boot-id-dry-run ssh -n "${SSH_OPTS[@]}" -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT" "$SSH_TARGET" \
+    "$(boot_id_command)" >"$out" || return
+  BOOT_ID="$(<"$out")"
+  BOOT_ID="${BOOT_ID//$'\r'/}"
+  [[ "$BOOT_ID" =~ ^[A-Za-z0-9.:-]+$ ]] || { BOOT_ID=""; return 1; }
 }
 
 # Set BOOT_ID to the boot ID, retrying SSH_POLL_SECONDS apart until
 # SSH_WAIT_SECONDS have passed. SSH answering is not enough. Measured on a
 # Windows Server 2022 build: right after the reboot that follows updates, SSH
 # answered 3 times in a row and the next boot-ID read failed, because WMI was
-# not ready yet. The loop runs in this shell, not in a command substitution,
-# so a signal is still handled between attempts.
+# not ready yet. Each attempt and each sleep runs in this shell, so a signal
+# is handled while either is in flight.
 read_boot_id_waiting() {
   local deadline=$((SECONDS + SSH_WAIT_SECONDS)) attempt=1
-  until BOOT_ID="$(read_boot_id)"; do
+  until read_boot_id; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       die "cannot read the boot ID of $SSH_TARGET ($attempt attempts over ${SSH_WAIT_SECONDS}s)"
     fi
@@ -546,7 +551,7 @@ wait_new_boot() {
   deadline=$((SECONDS + SSH_WAIT_SECONDS))
   log "waiting up to ${SSH_WAIT_SECONDS}s for $SSH_TARGET to answer with a new boot ID"
   while :; do
-    now="$(read_boot_id 2>/dev/null)" || now=""
+    if read_boot_id 2>/dev/null; then now="$BOOT_ID"; else now=""; fi
     if [ -n "$now" ] && [ "$now" != "$before" ]; then
       log "the VM rebooted (boot ID $before -> $now)"
       break

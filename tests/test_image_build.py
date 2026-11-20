@@ -234,8 +234,8 @@ BASE_RECIPE = {
 # of successive readiness probes (`exit 0`); its last code repeats. The first
 # FAKE_BOOT_FAIL_TIMES boot-ID reads fail, as on a Windows VM that answers SSH
 # before the read works. FAKE_BOOT_HANG makes every boot-ID read hang.
-# FAKE_CLOCK_STEPS makes a LastBootUpTime read print a new value every time
-# within one boot, as it did on a Windows domain controller build.
+# FAKE_LAST_BOOT_TIME_DRIFT makes a LastBootUpTime read print a new value
+# every time within one boot, as one did on a Windows domain controller build.
 FAKE_SSH = LOG_CALL + (
     'for a in "$@"; do last="$a"; done; printf "%s\\0" "$last" >> "$CALL_LOG.remote"\n'
     'boot="$CALL_LOG.boot"; pending="$CALL_LOG.reboot-pending"\n'
@@ -258,8 +258,8 @@ FAKE_SSH = LOG_CALL + (
     '    echo $((n + 1)) > "$c"; echo "the boot-ID read failed" >&2; exit 1\n'
     '  fi\n'
     '  case "$last" in *LastBootUpTime*)\n'
-    '    if [ -n "${FAKE_CLOCK_STEPS:-}" ]; then\n'
-    '      c="$CALL_LOG.clock-steps"; n=$(( $(cat "$c" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$c"\n'
+    '    if [ -n "${FAKE_LAST_BOOT_TIME_DRIFT:-}" ]; then\n'
+    '      c="$CALL_LOG.last-boot-drift"; n=$(( $(cat "$c" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$c"\n'
     '      echo "boot-$(cat "$boot").$n"; exit 0\n'
     '    fi ;;\n'
     '  esac\n'
@@ -592,7 +592,7 @@ def test_windows_boot_id_holds_when_last_boot_time_moves(tmp_path):
     env, recipe = _build_env(tmp_path / "reboot", "windows")
     _fast_sleep(tmp_path / "reboot")
     env.update(FAKE_SSH_FAIL_ON="setup.ps1", FAKE_SSH_FAIL_RC="100", FAKE_BOOT_FLIP_AFTER="3",
-               FAKE_CLOCK_STEPS="1")
+               FAKE_LAST_BOOT_TIME_DRIFT="1")
     result = _build(env, recipe, "fake")
     assert result.returncode == 0, result.stderr
     timeline = _timeline(tmp_path / "reboot")
@@ -608,7 +608,7 @@ def test_windows_boot_id_holds_when_last_boot_time_moves(tmp_path):
     # so the build stops when the wait runs out.
     env, recipe = _build_env(tmp_path / "same", "windows")
     _fast_sleep(tmp_path / "same")
-    env.update(FAKE_SSH_FAIL_ON="setup.ps1", FAKE_SSH_FAIL_RC="255", FAKE_CLOCK_STEPS="1",
+    env.update(FAKE_SSH_FAIL_ON="setup.ps1", FAKE_SSH_FAIL_RC="255", FAKE_LAST_BOOT_TIME_DRIFT="1",
                IMAGE_BUILD_SSH_WAIT_SECONDS="2")
     result = _build(env, recipe, "fake")
     assert result.returncode == 1, result.stderr

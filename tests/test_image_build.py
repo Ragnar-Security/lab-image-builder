@@ -231,7 +231,9 @@ BASE_RECIPE = {
 # a VM still going down answers with its old boot.
 # FAKE_SSH_FAIL_ON fails every matching call with FAKE_SSH_FAIL_RC, or only
 # the first FAKE_SSH_FAIL_TIMES of them. FAKE_SSH_PROBES lists the exit codes
-# of successive readiness probes (`exit 0`); its last code repeats.
+# of successive readiness probes (`exit 0`); its last code repeats. The first
+# FAKE_BOOT_FAIL_TIMES boot-ID reads fail, as WMI does on a Windows VM that
+# answers SSH before it is ready.
 FAKE_SSH = LOG_CALL + (
     'for a in "$@"; do last="$a"; done; printf "%s\\0" "$last" >> "$CALL_LOG.remote"\n'
     'boot="$CALL_LOG.boot"; pending="$CALL_LOG.reboot-pending"\n'
@@ -247,7 +249,13 @@ FAKE_SSH = LOG_CALL + (
     'case "$last" in *"systemctl reboot"*|*Restart-Computer*|*"${FAKE_SSH_REBOOT_ON:-@none@}"*)\n'
     '  echo "${FAKE_BOOT_FLIP_AFTER:-0}" > "$pending" ;;\n'
     'esac\n'
-    'case "$last" in *boot_id*|*LastBootUpTime*) echo "boot-$(cat "$boot")"; exit 0 ;; esac\n'
+    'case "$last" in *boot_id*|*LastBootUpTime*)\n'
+    '  c="$CALL_LOG.boot-fails"; n=$(cat "$c" 2>/dev/null || echo 0)\n'
+    '  if [ "$n" -lt "${FAKE_BOOT_FAIL_TIMES:-0}" ]; then\n'
+    '    echo $((n + 1)) > "$c"; echo "Get-CimInstance : Call was canceled." >&2; exit 1\n'
+    '  fi\n'
+    '  echo "boot-$(cat "$boot")"; exit 0 ;;\n'
+    'esac\n'
     'if [ "$last" = "exit 0" ] && [ -n "${FAKE_SSH_PROBES:-}" ]; then\n'
     '  c="$CALL_LOG.probes"; n=$(cat "$c" 2>/dev/null || echo 0); echo $((n + 1)) > "$c"\n'
     '  i=0; for code in $FAKE_SSH_PROBES; do rc=$code; [ "$i" -eq "$n" ] && break; i=$((i + 1)); done\n'
@@ -564,6 +572,35 @@ def test_setup_session_drop_requires_a_new_boot(tmp_path):
     assert result.returncode == 1
     steps = _events(_calls(tmp_path / "fail"), "setup.sh", "verify.sh", "seal_linux.sh")
     assert "verify" not in steps and "save" not in steps
+    assert steps[-1] == "destroy"
+
+
+def test_boot_id_read_before_setup_retries_until_it_answers(tmp_path):
+    # SSH is up, but the first two boot-ID reads fail: the build waits and goes on.
+    env, recipe = _build_env(tmp_path, "windows")
+    _fast_sleep(tmp_path)
+    env.update(FAKE_BOOT_FAIL_TIMES="2")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    assert "(attempt 1); retrying in 10s" in result.stderr
+    assert "(attempt 2); retrying in 10s" in result.stderr
+    assert "(attempt 3)" not in result.stderr
+    timeline = _timeline(tmp_path)
+    commands = [c for _b, c in timeline]
+    i_setup = next(i for i, c in enumerate(commands) if "setup.ps1" in c)
+    # Setup ran only after a boot-ID read succeeded (the third read).
+    assert sum(_is_boot_read(c) for c in commands[:i_setup]) == 3, commands
+
+
+def test_boot_id_read_before_setup_gives_up_when_the_wait_runs_out(tmp_path):
+    env, recipe = _build_env(tmp_path, "windows")
+    _fast_sleep(tmp_path)
+    env.update(FAKE_BOOT_FAIL_TIMES="100000", IMAGE_BUILD_SSH_WAIT_SECONDS="2")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 1, result.stderr
+    assert "cannot read the boot ID of" in result.stderr and "attempts over 2s" in result.stderr
+    steps = _events(_calls(tmp_path), "setup.ps1", "verify.ps1", "seal_windows.ps1")
+    assert "setup" not in steps and "save" not in steps
     assert steps[-1] == "destroy"
 
 

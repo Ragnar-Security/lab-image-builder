@@ -493,6 +493,24 @@ read_boot_id() {
   printf '%s\n' "$out"
 }
 
+# Set BOOT_ID to the boot ID, retrying SSH_POLL_SECONDS apart until
+# SSH_WAIT_SECONDS have passed. SSH answering is not enough. Measured on a
+# Windows Server 2022 build: right after the reboot that follows updates, SSH
+# answered 3 times in a row and the next boot-ID read failed, because WMI was
+# not ready yet. The loop runs in this shell, not in a command substitution,
+# so a signal is still handled between attempts.
+read_boot_id_waiting() {
+  local deadline=$((SECONDS + SSH_WAIT_SECONDS)) attempt=1
+  until BOOT_ID="$(read_boot_id)"; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      die "cannot read the boot ID of $SSH_TARGET ($attempt attempts over ${SSH_WAIT_SECONDS}s)"
+    fi
+    log "cannot read the boot ID of $SSH_TARGET (attempt $attempt); retrying in ${SSH_POLL_SECONDS}s"
+    attempt=$((attempt + 1))
+    run_bg sleep "$SSH_POLL_SECONDS"
+  done
+}
+
 # The reboot a setup asks for with exit 100. Started in the background, so
 # the SSH call returns before the VM goes down.
 reboot_command() {
@@ -896,7 +914,8 @@ for ((pass = 1; pass <= SETUP_PASSES; pass++)); do
   fi
   # Recorded before setup runs: after a reboot, only a different boot ID
   # proves the VM went down and came back.
-  BOOT_BEFORE="$(read_boot_id)" || die "cannot read the boot ID of $SSH_TARGET"
+  read_boot_id_waiting
+  BOOT_BEFORE="$BOOT_ID"
   if [ "$DRY_RUN" = 1 ]; then
     if declare -F backend_reboot >/dev/null; then
       log "DRY RUN: if setup exits $SETUP_REBOOT_RC, the core calls backend_reboot ($BACKEND)"

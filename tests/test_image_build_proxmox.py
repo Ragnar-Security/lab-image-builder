@@ -62,7 +62,7 @@ if prog == "ssh":
     nodes = json.loads(os.environ["FAKE_PVE_HOSTS"])
     if user != "root" or host not in nodes:
         # A build VM: it never reboots here, so its boot ID is constant.
-        if "boot_id" in cmd or "LastBootUpTime" in cmd:
+        if "boot_id" in cmd or "StartTime" in cmd:
             print("boot-1")
         sys.exit(0)
     with open(os.environ["PVE_LOG"] + ".remote", "a") as f:

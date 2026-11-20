@@ -231,12 +231,16 @@ BASE_RECIPE = {
 # a VM still going down answers with its old boot.
 # FAKE_SSH_FAIL_ON fails every matching call with FAKE_SSH_FAIL_RC, or only
 # the first FAKE_SSH_FAIL_TIMES of them. FAKE_SSH_PROBES lists the exit codes
-# of successive readiness probes (`exit 0`); its last code repeats.
+# of successive readiness probes (`exit 0`); its last code repeats. The first
+# FAKE_BOOT_FAIL_TIMES boot-ID reads fail, as on a Windows VM that answers SSH
+# before the read works. FAKE_BOOT_HANG makes every boot-ID read hang.
+# FAKE_LAST_BOOT_TIME_DRIFT makes a LastBootUpTime read print a new value
+# every time within one boot, as one did on a Windows domain controller build.
 FAKE_SSH = LOG_CALL + (
     'for a in "$@"; do last="$a"; done; printf "%s\\0" "$last" >> "$CALL_LOG.remote"\n'
     'boot="$CALL_LOG.boot"; pending="$CALL_LOG.reboot-pending"\n'
     '[ -f "$boot" ] || echo 1 > "$boot"\n'
-    'case "$last" in *boot_id*|*LastBootUpTime*)\n'
+    'case "$last" in *boot_id*|*StartTime*|*LastBootUpTime*)\n'
     '  if [ -f "$pending" ]; then\n'
     '    n=$(cat "$pending")\n'
     '    if [ "$n" -le 0 ]; then echo $(( $(cat "$boot") + 1 )) > "$boot"; rm -f "$pending"\n'
@@ -247,7 +251,20 @@ FAKE_SSH = LOG_CALL + (
     'case "$last" in *"systemctl reboot"*|*Restart-Computer*|*"${FAKE_SSH_REBOOT_ON:-@none@}"*)\n'
     '  echo "${FAKE_BOOT_FLIP_AFTER:-0}" > "$pending" ;;\n'
     'esac\n'
-    'case "$last" in *boot_id*|*LastBootUpTime*) echo "boot-$(cat "$boot")"; exit 0 ;; esac\n'
+    'case "$last" in *boot_id*|*StartTime*|*LastBootUpTime*)\n'
+    '  [ -z "${FAKE_BOOT_HANG:-}" ] || PATH=/usr/bin:/bin exec sleep 30\n'
+    '  c="$CALL_LOG.boot-fails"; n=$(cat "$c" 2>/dev/null || echo 0)\n'
+    '  if [ "$n" -lt "${FAKE_BOOT_FAIL_TIMES:-0}" ]; then\n'
+    '    echo $((n + 1)) > "$c"; echo "the boot-ID read failed" >&2; exit 1\n'
+    '  fi\n'
+    '  case "$last" in *LastBootUpTime*)\n'
+    '    if [ -n "${FAKE_LAST_BOOT_TIME_DRIFT:-}" ]; then\n'
+    '      c="$CALL_LOG.last-boot-drift"; n=$(( $(cat "$c" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$c"\n'
+    '      echo "boot-$(cat "$boot").$n"; exit 0\n'
+    '    fi ;;\n'
+    '  esac\n'
+    '  echo "boot-$(cat "$boot")"; exit 0 ;;\n'
+    'esac\n'
     'if [ "$last" = "exit 0" ] && [ -n "${FAKE_SSH_PROBES:-}" ]; then\n'
     '  c="$CALL_LOG.probes"; n=$(cat "$c" 2>/dev/null || echo 0); echo $((n + 1)) > "$c"\n'
     '  i=0; for code in $FAKE_SSH_PROBES; do rc=$code; [ "$i" -eq "$n" ] && break; i=$((i + 1)); done\n'
@@ -503,7 +520,7 @@ def _timeline(tmp_path: Path) -> list:
 
 
 def _is_boot_read(command: str) -> bool:
-    return "boot_id" in command or "LastBootUpTime" in command
+    return any(s in command for s in ("boot_id", "StartTime", "LastBootUpTime"))
 
 
 def test_setup_exit_100_core_reboots_and_waits_for_new_boot(tmp_path):
@@ -564,6 +581,69 @@ def test_setup_session_drop_requires_a_new_boot(tmp_path):
     assert result.returncode == 1
     steps = _events(_calls(tmp_path / "fail"), "setup.sh", "verify.sh", "seal_linux.sh")
     assert "verify" not in steps and "save" not in steps
+    assert steps[-1] == "destroy"
+
+
+def test_windows_boot_id_holds_when_last_boot_time_moves(tmp_path):
+    # The VM's LastBootUpTime moves on every read within one boot, as it did on
+    # a domain controller build, where a change read just after the reboot
+    # command was taken for a reboot. The boot ID the builder reads must stay
+    # the same until the VM really reboots.
+    env, recipe = _build_env(tmp_path / "reboot", "windows")
+    _fast_sleep(tmp_path / "reboot")
+    env.update(FAKE_SSH_FAIL_ON="setup.ps1", FAKE_SSH_FAIL_RC="100", FAKE_BOOT_FLIP_AFTER="3",
+               FAKE_LAST_BOOT_TIME_DRIFT="1")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    timeline = _timeline(tmp_path / "reboot")
+    commands = [c for _b, c in timeline]
+    i_reboot = next(i for i, c in enumerate(commands) if "Restart-Computer -Force" in c)
+    i_verify = next(i for i, c in enumerate(commands) if "verify.ps1" in c)
+    assert timeline[i_verify][0] == "boot-2", timeline
+    polls = [b for b, c in timeline[i_reboot + 1:i_verify] if _is_boot_read(c)]
+    assert polls[:3] == ["boot-1"] * 3, timeline
+    assert "the VM rebooted (boot ID boot-1 -> boot-2)" in result.stderr
+
+    # The session drops without a reboot: an unchanged boot ID is no reboot,
+    # so the build stops when the wait runs out.
+    env, recipe = _build_env(tmp_path / "same", "windows")
+    _fast_sleep(tmp_path / "same")
+    env.update(FAKE_SSH_FAIL_ON="setup.ps1", FAKE_SSH_FAIL_RC="255", FAKE_LAST_BOOT_TIME_DRIFT="1",
+               IMAGE_BUILD_SSH_WAIT_SECONDS="2")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 1, result.stderr
+    assert "SSH dropped during setup but the VM did not reboot" in result.stderr
+    steps = _events(_calls(tmp_path / "same"), "setup.ps1", "verify.ps1", "seal_windows.ps1")
+    assert "verify" not in steps and "save" not in steps
+    assert steps[-1] == "destroy"
+
+
+def test_boot_id_read_before_setup_retries_until_it_answers(tmp_path):
+    # SSH is up, but the first two boot-ID reads fail: the build waits and goes on.
+    env, recipe = _build_env(tmp_path, "windows")
+    _fast_sleep(tmp_path)
+    env.update(FAKE_BOOT_FAIL_TIMES="2")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    assert "(attempt 1); retrying in 10s" in result.stderr
+    assert "(attempt 2); retrying in 10s" in result.stderr
+    assert "(attempt 3)" not in result.stderr
+    timeline = _timeline(tmp_path)
+    commands = [c for _b, c in timeline]
+    i_setup = next(i for i, c in enumerate(commands) if "setup.ps1" in c)
+    # Setup ran only after a boot-ID read succeeded (the third read).
+    assert sum(_is_boot_read(c) for c in commands[:i_setup]) == 3, commands
+
+
+def test_boot_id_read_before_setup_gives_up_when_the_wait_runs_out(tmp_path):
+    env, recipe = _build_env(tmp_path, "windows")
+    _fast_sleep(tmp_path)
+    env.update(FAKE_BOOT_FAIL_TIMES="100000", IMAGE_BUILD_SSH_WAIT_SECONDS="2")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 1, result.stderr
+    assert "cannot read the boot ID of" in result.stderr and "attempts over 2s" in result.stderr
+    steps = _events(_calls(tmp_path), "setup.ps1", "verify.ps1", "seal_windows.ps1")
+    assert "setup" not in steps and "save" not in steps
     assert steps[-1] == "destroy"
 
 
@@ -705,7 +785,7 @@ def _wait_for(predicate, proc, what: str, timeout: float = 30) -> None:
 
 
 def _signalled_build(tmp_path: Path, sigs, *, log_reader_dead: bool, group: bool,
-                     during_destroy=(), env_extra=None, ready=None):
+                     during_destroy=(), env_extra=None, ready=None, started="setup.sh"):
     """Start a build in its own process group, as a launcher running it in the
     background would, and send `sigs` once setup is running on the build VM.
     log_reader_dead: stderr is a pipe whose only reader is gone before the
@@ -713,6 +793,7 @@ def _signalled_build(tmp_path: Path, sigs, *, log_reader_dead: bool, group: bool
     so it also reaches the in-flight setup `ssh`. during_destroy: signals sent
     to the group while the trap's destroy is running. env_extra: more
     environment. ready: a file (next to CALL_LOG) to wait for as well.
+    started: the remote command that must be in flight before the signal.
     Returns (exit code, CALL_LOG text, stderr text or None, seconds from the
     first signal to the exit)."""
     env, recipe = _build_env(tmp_path)
@@ -729,8 +810,8 @@ def _signalled_build(tmp_path: Path, sigs, *, log_reader_dead: bool, group: bool
                             stderr=subprocess.PIPE if log_reader_dead else err_file,
                             start_new_session=True)
     try:
-        _wait_for(lambda: "setup.sh" in "".join(_remote_commands(_calls(tmp_path))),
-                  proc, "setup started")
+        _wait_for(lambda: started in "".join(_remote_commands(_calls(tmp_path))),
+                  proc, f"{started} started")
         if ready:
             _wait_for(Path(env["CALL_LOG"] + ready).exists, proc, ready)
         if log_reader_dead:
@@ -842,6 +923,19 @@ def test_term_ignoring_command_is_killed_within_the_bound(tmp_path):
     assert not _alive(tmp_path / "calls.log.stubborn")
     assert not _alive(tmp_path / "calls.log.stubborn-child")
     assert "the running command ignored TERM for 2s; killed it" in stderr
+    _assert_destroyed_once(tmp_path, calls)
+
+
+def test_signal_during_a_hung_boot_id_read_destroys_within_the_bound(tmp_path):
+    # The boot-ID read before setup hangs (WMI never answers), and TERM reaches
+    # only the builder, not the ssh. The read runs through run_bg, so the trap
+    # runs at once instead of after the 30 s hang.
+    rc, calls, stderr, elapsed = _signalled_build(
+        tmp_path, [signal.SIGTERM], log_reader_dead=False, group=False, started="boot_id",
+        env_extra={"FAKE_BOOT_HANG": "1"})
+    assert rc == 143, stderr
+    assert elapsed < 15, elapsed
+    assert "FAILED during setup pass 1/1 (exit 143)" in stderr
     _assert_destroyed_once(tmp_path, calls)
 
 

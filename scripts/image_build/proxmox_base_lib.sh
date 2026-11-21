@@ -11,6 +11,9 @@
 #   user_data        prints the first-boot cloud-config (no key, no password);
 #   finalize_script  prints the script run as root in the guest, through the
 #                    guest agent, once cloud-init is done.
+# and may set
+#   BUILD_CPU   a Proxmox CPU type for the template (clones inherit it);
+#               unset keeps qm's default (kvm64).
 # It checks the config and the cluster, creates the VM, imports the cloud
 # image, boots it with the user-data, runs the finalize, removes the
 # cloud-init drive and makes the VM a template. Every guarantee in the
@@ -283,7 +286,9 @@ else
 fi
 
 VM_ARMED="$APPLY"
-run qm create "$VMID" --name "$NAME" --ostype l26 --cores "$BUILD_CORES" --memory "$BUILD_MEMORY" \
+cpu_args=()
+if [ -n "${BUILD_CPU:-}" ]; then cpu_args=(--cpu "$BUILD_CPU"); fi
+run qm create "$VMID" --name "$NAME" --ostype l26 ${cpu_args[@]+"${cpu_args[@]}"} --cores "$BUILD_CORES" --memory "$BUILD_MEMORY" \
     --agent enabled=1 --scsihw virtio-scsi-single --serial0 socket --vga serial0 \
     --net0 "virtio,bridge=$PVE_BUILD_BRIDGE,tag=$PVE_BUILD_VLAN" \
     --description "$RUN_TAG $NAME under construction by $(basename "$SCRIPT_NAME"); not a template yet"

@@ -214,5 +214,9 @@ EOF
 }
 
 BASE_LABEL="Rocky Linux 9"
+# RHEL 9 is built for x86-64-v2: on qm's default CPU (kvm64) glibc stops init
+# ("Fatal glibc error: CPU does not support x86-64-v2") and the kernel
+# panics. Clones of the template, and so every image built on it, inherit it.
+BUILD_CPU=x86-64-v2-AES
 # shellcheck source=proxmox_base_lib.sh
 source "$SCRIPT_DIR/proxmox_base_lib.sh"

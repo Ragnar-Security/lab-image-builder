@@ -649,6 +649,11 @@ grep SHA256 $R.CHECKSUM; sha256sum $R      # the two must match
 
 What differs from the Ubuntu base:
 
+- **CPU type.** RHEL 9 is built for x86-64-v2. On `qm create`'s default CPU
+  (`kvm64`) its glibc stops init ("Fatal glibc error: CPU does not support
+  x86-64-v2") and the kernel panics, so no agent ever answers. The template
+  is created with `--cpu x86-64-v2-AES`; clones, and every image built on
+  it, inherit the type.
 - **guest-exec.** Rocky's `qemu-guest-agent` allows only a list of RPCs
   (`FILTER_RPC_ARGS` in `/etc/sysconfig/qemu-ga`) that leaves `guest-exec`
   out, and the builder injects its key, and this script runs its finalize,

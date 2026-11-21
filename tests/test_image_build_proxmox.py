@@ -815,6 +815,46 @@ def test_proxmox_node_names_checked_at_config_time(tmp_path):
         assert _ssh_calls(sub) == [], key
 
 
+def test_proxmox_build_jump_host_reaches_build_vm(tmp_path):
+    # PVE_BUILD_JUMP_HOST replaces only the jump to the build VM (a build node
+    # with no route to the build VLAN); every node command still goes to
+    # root@PVE_HOST.
+    env, recipe = _pve_env(tmp_path, _cluster())
+    Path(env["IMAGE_BUILD_CONFIG"]).write_text(PVE_CONFIG + "PVE_BUILD_JUMP_HOST=jump-host.invalid\n")
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 0, result.stderr
+    calls = _ssh_calls(tmp_path)
+    vm_ssh = [l for l in calls if " builder@192.0.2.10 " in l]
+    assert vm_ssh and all("-J root@jump-host.invalid" in l for l in vm_ssh), vm_ssh
+    assert not any("pve-host.invalid" in l for l in vm_ssh), vm_ssh
+    assert all(" builder@192.0.2.10 " in l for l in calls if "jump-host.invalid" in l), calls
+    assert _clones(tmp_path) and all(c in _pve_cmds(tmp_path, "pve") for c in _clones(tmp_path))
+    assert "via root@jump-host.invalid" in result.stderr
+    assert _yaml(result) == "template_locations: {pve: 8000, pve2: 8500}"
+
+
+def test_proxmox_build_jump_host_empty_means_pve_host(tmp_path):
+    env, recipe = _pve_env(tmp_path, _cluster())
+    Path(env["IMAGE_BUILD_CONFIG"]).write_text(PVE_CONFIG + "PVE_BUILD_JUMP_HOST=\n")
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 0, result.stderr
+    vm_ssh = [l for l in _ssh_calls(tmp_path) if " builder@192.0.2.10 " in l]
+    assert vm_ssh and all("-J root@pve-host.invalid" in l for l in vm_ssh), vm_ssh
+
+
+def test_proxmox_build_jump_host_unsafe_values_refused(tmp_path):
+    # It reaches ssh -J as root@<value>: an option or shell syntax is refused
+    # before any ssh call.
+    for i, value in enumerate(("-oProxyCommand=x", "jump;id", "jump x", "user@jump", "jump:22")):
+        sub = tmp_path / str(i)
+        env, recipe = _pve_env(sub, _cluster())
+        Path(env["IMAGE_BUILD_CONFIG"]).write_text(PVE_CONFIG + f"PVE_BUILD_JUMP_HOST={shlex.quote(value)}\n")
+        result = _build(env, recipe, "proxmox")
+        assert result.returncode == 2, (value, result.stderr)
+        assert "PVE_BUILD_JUMP_HOST" in result.stderr, (value, result.stderr)
+        assert _ssh_calls(sub) == [], value
+
+
 def test_proxmox_failed_description_rewrite_names_the_template(tmp_path):
     env, recipe = _pve_env(tmp_path, _cluster())
     env["FAKE_PVE_DESC_FAIL"] = "1"

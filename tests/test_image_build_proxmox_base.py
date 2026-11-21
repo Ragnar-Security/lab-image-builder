@@ -342,6 +342,66 @@ def test_vmid_outside_block_or_in_use_is_refused(tmp_path):
     assert not any(c.startswith("qm ") for c in _cmds(tmp_path / "used"))
 
 
+# --- releases: --release picks the cloud image, the name and the SSH unit ------
+
+
+RELEASES = {
+    # release: (version, codename, the unit that owns port 22 on that release)
+    "2004": ("20.04", "focal", "ssh.service"),
+    "2204": ("22.04", "jammy", "ssh.service"),
+    "2404": ("24.04", "noble", "ssh.socket"),
+}
+
+
+@pytest.mark.parametrize("release", sorted(RELEASES))
+def test_release_names_the_template_and_enables_its_ssh_unit(tmp_path, release):
+    version, _, unit = RELEASES[release]
+    other = "ssh.socket" if unit == "ssh.service" else "ssh.service"
+    name = f"base-ubuntu-{release}-{DATE}"
+    dry = _run(tmp_path / "dry", "--release", release)
+    assert dry.returncode == 0, dry.stderr
+    assert f"VM 8000 '{name}'" in dry.stderr, dry.stderr
+    assert f"snippets/{name}-user.yaml" in dry.stderr, dry.stderr
+    # Ubuntu 22.10 moved port 22 to ssh.socket; before it ssh.service owns it,
+    # and enabling ssh.socket there as well makes the two units conflict.
+    assert f"[systemctl, enable, {unit}]" in dry.stderr, dry.stderr
+    assert f"[systemctl, enable, {other}]" not in dry.stderr, dry.stderr
+    assert f"systemctl is-enabled {unit}" in dry.stderr, dry.stderr
+    assert f"systemctl is-enabled {other}" not in dry.stderr, dry.stderr
+    applied = _run(tmp_path / "apply", "--apply", "--release", release)
+    assert applied.returncode == 0, applied.stderr
+    g = _state(tmp_path / "apply")["8000"]
+    assert g["template"] == 1 and g["name"] == name, g
+    assert g["description"].startswith(f"{name}: Ubuntu {version} cloud image noble.img sha256 "), g
+    assert not (tmp_path / "apply" / "snippets" / f"{name}-user.yaml").exists()
+
+
+@pytest.mark.parametrize("release", sorted(RELEASES))
+def test_release_picks_its_cloud_image_by_default(tmp_path, release):
+    codename = RELEASES[release][1]
+    args = ["bash", str(SCRIPT), "--snippets", "snipstore", "--date", DATE, "--release", release]
+    result = subprocess.run(args, env=_env(tmp_path), capture_output=True, text=True, timeout=120,
+                            stdin=subprocess.DEVNULL)
+    # No such file on the fake node: the error names the path the release chose.
+    assert result.returncode == 1, result.stderr
+    assert f"/var/lib/vz/template/iso/{codename}-server-cloudimg-amd64.img not found" in result.stderr
+
+
+def test_release_defaults_to_2404(tmp_path):
+    result = _run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert f"VM 8000 '{NAME}'" in result.stderr
+    assert "[systemctl, enable, ssh.socket]" in result.stderr
+
+
+@pytest.mark.parametrize("bad", ["1804", "24.04", "noble", "2404 "])
+def test_unknown_release_is_refused_before_the_node_is_reached(tmp_path, bad):
+    result = _run(tmp_path, "--release", bad)
+    assert result.returncode == 1, result.stderr
+    assert "--release must be one of 2004 2204 2404" in result.stderr, result.stderr
+    assert not (tmp_path / "calls.log").exists()
+
+
 # --- finding 1: a half-made VM is destroyed, and only when it carries the marker ---
 
 

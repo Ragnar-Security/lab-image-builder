@@ -55,8 +55,17 @@ if ($dlv -match 'Remaining Windows rearm count:\s*(\d+)' -and [int]$Matches[1] -
 }
 
 Step 'sshd: disabled until first-boot setup finishes; no host or authorized keys'
-Stop-Service -Name sshd
+# Disabled first, so nothing starts it again; then a pending state is waited
+# out, because a service that is still starting refuses a stop. On Server 2016
+# with the Win32-OpenSSH MSI a plain Stop-Service failed ("Cannot stop sshd
+# service") about two minutes after a boot; the line below records the state.
 Set-Service -Name sshd -StartupType Disabled
+$svc = Get-CimInstance Win32_Service -Filter "Name='sshd'"
+Write-Output "sshd before the stop: $($svc.State), start mode $($svc.StartMode), delayed $($svc.DelayedAutoStart), exit code $($svc.ExitCode)"
+$deadline = (Get-Date).AddMinutes(5)
+while ((Get-Service -Name sshd).Status -like '*Pending' -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 5 }
+if ((Get-Service -Name sshd).Status -ne 'Stopped') { Stop-Service -Name sshd }
+(Get-Service -Name sshd).WaitForStatus('Stopped', [TimeSpan]::FromMinutes(1))
 Remove-Item -Force -ErrorAction SilentlyContinue "$ssh\ssh_host_*", "$ssh\administrators_authorized_keys"
 Get-ChildItem -Path 'C:\Users\*\.ssh\authorized_keys' -Force -ErrorAction SilentlyContinue | Remove-Item -Force
 $left = @(Get-ChildItem -Path "$ssh\ssh_host_*", "$ssh\administrators_authorized_keys" -ErrorAction SilentlyContinue)

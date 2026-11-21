@@ -21,9 +21,12 @@
 #
 # Config: PVE_HOST and PVE_REPLICA_HOST are SSH addresses (root, key auth);
 # PVE_NODE and PVE_REPLICA_NODE are the cluster's node names, as in
-# templates.yaml ([a-z0-9-]). Every value that reaches a remote shell is
-# checked against a strict pattern by backend_check_config, and every remote
-# argument is quoted by pve(). Needs python3 locally to read pvesh/qm JSON.
+# templates.yaml ([a-z0-9-]). PVE_BUILD_JUMP_HOST (optional, default
+# PVE_HOST) is the SSH address the build VM is reached through, for a build
+# node with no route to the build VLAN. Every value that reaches a remote
+# shell or ssh is checked against a strict pattern by backend_check_config,
+# and every remote argument is quoted by pve(). Needs python3 locally to read
+# pvesh/qm JSON.
 
 # The config keys this backend reads (the core imports only these).
 BACKEND_CONFIG_PREFIX=PVE_
@@ -333,9 +336,9 @@ backend_check_config() {
       bad=1
     fi
   done
-  # Each of these reaches a root shell on a node.
+  # Each of these reaches a root shell on a node, or ssh as root@<value>.
   for key in PVE_HOST PVE_NODE PVE_REPLICA_NODE PVE_REPLICA_HOST PVE_STORAGE \
-             PVE_REPLICA_STORAGE PVE_BUILD_BRIDGE; do
+             PVE_REPLICA_STORAGE PVE_BUILD_BRIDGE PVE_BUILD_JUMP_HOST; do
     if [ -n "${!key:-}" ] && ! [[ "${!key}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
       echo "proxmox: $key must match [A-Za-z0-9][A-Za-z0-9._-]* (got '${!key}')" >&2
       bad=1
@@ -424,7 +427,7 @@ backend_start() {
   fi
 
   BUILD_SSH_HOST="$(query build-vm-ip _pve_guest_ip "$vmid")"
-  BUILD_SSH_JUMP="root@$PVE_HOST"
+  BUILD_SSH_JUMP="root@${PVE_BUILD_JUMP_HOST:-$PVE_HOST}"
 }
 
 backend_save() {

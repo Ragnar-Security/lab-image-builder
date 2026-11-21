@@ -132,14 +132,15 @@ recipe sets those.
 
 | Backend | Key | Meaning |
 |---|---|---|
-| Proxmox | `PVE_HOST` | Address of the build node. Reached as root over SSH, key auth. Also the jump host to the build VM. |
+| Proxmox | `PVE_HOST` | Address of the build node. Reached as root over SSH, key auth. Also the jump host to the build VM, unless `PVE_BUILD_JUMP_HOST` is set. |
 | Proxmox | `PVE_NODE` | Node that runs the build VM (default `pve`). Lowercase letters, digits and `-` only, as `templates.yaml` takes it; checked before the build. |
 | Proxmox | `PVE_REPLICA_NODE` | Node that receives the template copy (default `pve2`). Same rule as `PVE_NODE`. |
-| Proxmox | `PVE_REPLICA_HOST` | Address of the replica node. |
+| Proxmox | `PVE_REPLICA_HOST` | Address of the replica node. The copy's `scp` runs on the build node, so this address must work from `PVE_NODE` as well as from the machine running the build. |
 | Proxmox | `PVE_STORAGE` | Storage for the build VM's disk on `PVE_NODE`. |
 | Proxmox | `PVE_REPLICA_STORAGE` | Storage for the replica template. |
 | Proxmox | `PVE_BUILD_BRIDGE` | Bridge of the provisioning network (has internet). |
 | Proxmox | `PVE_BUILD_VLAN` | VLAN tag of that network, 1-4094. |
+| Proxmox | `PVE_BUILD_JUMP_HOST` | Optional. Address the build VM is reached through over SSH (as root, key auth), for a build node with no route to the build VLAN. Default: `PVE_HOST`. Same character rule as `PVE_HOST`. |
 | AWS | `AWS_BUILD_REGION` | Region. Every call names it; a profile default never decides. |
 | AWS | `AWS_BUILD_SUBNET_ID` | A public subnet in the build VPC, not the lab VPC. |
 | AWS | `AWS_BUILD_SG_ID` | Security group that admits SSH from the build host only. |
@@ -519,7 +520,8 @@ run ID; never put anything else in an `ib-...` group.
 The build full-clones the newest template matching `BASE_PROXMOX` on
 `PVE_NODE` (by the date or timestamp in the last hyphen-separated field of its
 name, VMID below 9000). It starts the clone, injects a per-run SSH key through
-the guest agent, and reaches it over SSH through `root@PVE_HOST`. After seal,
+the guest agent, and reaches it over SSH through `root@PVE_HOST` (or
+`root@PVE_BUILD_JUMP_HOST` when that is set). After seal,
 it shuts the VM down, renames it to the image name, turns the build VM itself
 into the template, and copies that to `PVE_REPLICA_NODE` with
 `scripts/sync_template.sh`.

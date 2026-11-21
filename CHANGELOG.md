@@ -97,6 +97,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whole gzip stream against its trailer (CRC-32 and length) before writing
   anything, and refuses links, paths outside the payload directory and
   damaged tar headers.
+- Proxmox: optional `PVE_BUILD_JUMP_HOST`, the address the build VM is
+  reached through over SSH. A build node with no route to the build VLAN
+  (here `pve2`) builds by jumping through a node that has one. Unset or
+  empty, the jump is `root@PVE_HOST` as before. Checked with the other
+  config values before any SSH call.
 
 ### Changed
 

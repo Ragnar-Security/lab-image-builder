@@ -6,8 +6,11 @@ parts of the base contract that differ on a RHEL-family guest."""
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.test_image_build import IMAGE_BUILD
-from tests.test_image_build_proxmox_base import DATE, _cmds, _env, _marker, _state
+from tests.test_image_build_proxmox_base import (CLOUD_SHA, DATE, _cmds, _env, _marker,
+                                                 _state)
 
 SCRIPT = IMAGE_BUILD / "proxmox_base_rocky.sh"
 NAME = f"base-rocky-9-{DATE}"
@@ -16,7 +19,7 @@ NAME = f"base-rocky-9-{DATE}"
 def _run(tmp_path: Path, *extra, image=True, **env_extra):
     args = ["bash", str(SCRIPT), "--snippets", "snipstore", "--date", DATE, *extra]
     if image:
-        args[2:2] = ["--image", str(tmp_path / "noble.img")]
+        args[2:2] = ["--image", str(tmp_path / "noble.img"), "--sha256", CLOUD_SHA]
     return subprocess.run(args, env=_env(tmp_path, None, **env_extra), capture_output=True,
                           text=True, timeout=120, stdin=subprocess.DEVNULL)
 
@@ -69,11 +72,55 @@ def test_apply_builds_template_and_removes_snippet(tmp_path):
     assert not _snippet(tmp_path).exists()
 
 
-def test_default_image_is_the_rocky_9_generic_cloud_image(tmp_path):
+ROCKY_URL = ("https://dl.rockylinux.org/pub/rocky/9.9/images/x86_64/"
+             "Rocky-9-GenericCloud-Base-9.9-20261112.0.x86_64.qcow2")
+# Rocky's CHECKSUM for that file, and the image base-rocky-9-20261121 was built from.
+ROCKY_SHA = "4f88f4209de50813d8054ab97309e7169a580206a0c4ea04f375d36c4846d50e"
+
+
+def test_default_image_is_a_pinned_dated_rocky_9_image(tmp_path):
     result = _run(tmp_path, image=False)
+    # Absent on the fake node: the dry run plans to fetch the pinned URL and
+    # check it against the pinned hash. Nothing names the moving `latest`.
+    assert result.returncode == 0, result.stderr
+    out = result.stderr
+    local = "/var/lib/vz/template/iso/Rocky-9-GenericCloud-Base-9.9-20261112.0.x86_64.qcow2"
+    assert local in out and ROCKY_URL in out and ROCKY_SHA in out, out
+    assert "would run: sh -c" in out and "curl" in out, out
+    assert "latest" not in out, out
+
+
+def test_image_with_the_wrong_checksum_fails_closed(tmp_path):
+    # No --sha256: the pin applies, and the node's file is not the pinned image.
+    args = ["--image", str(tmp_path / "noble.img")]
+    for mode in ((), ("--apply",)):
+        sub = tmp_path / ("apply" if mode else "dry")
+        result = _run(sub, *mode, *[a.replace(str(tmp_path), str(sub)) for a in args], image=False)
+        assert result.returncode == 1, result.stderr
+        assert ROCKY_SHA in result.stderr and CLOUD_SHA in result.stderr, result.stderr
+        assert not any(c.startswith("qm ") for c in _cmds(sub)), _cmds(sub)
+
+
+def test_fetched_image_with_the_wrong_checksum_fails_closed(tmp_path):
+    image = tmp_path / "fetched.qcow2"
+    result = _run(tmp_path, "--apply", "--image", str(image), "--image-url", ROCKY_URL,
+                  "--sha256", ROCKY_SHA, image=False)
     assert result.returncode == 1, result.stderr
-    assert ("/var/lib/vz/template/iso/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2 not found"
-            in result.stderr), result.stderr
+    assert not image.exists() and not (tmp_path / "fetched.qcow2.part").exists()
+    assert not any(c.startswith("qm ") for c in _cmds(tmp_path)), _cmds(tmp_path)
+
+
+@pytest.mark.parametrize("url", [
+    "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2",
+    "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2",
+    "https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base-8.10-20240528.0.x86_64.qcow2",
+    "http://dl.rockylinux.org/pub/rocky/9.9/images/x86_64/Rocky-9-GenericCloud-Base-9.9-20261112.0.x86_64.qcow2",
+])
+def test_unpinned_image_url_is_refused_before_the_node_is_reached(tmp_path, url):
+    result = _run(tmp_path, "--image-url", url, "--sha256", CLOUD_SHA, image=False)
+    assert result.returncode == 1, result.stderr
+    assert "--image-url" in result.stderr, result.stderr
+    assert not (tmp_path / "calls.log").exists()
 
 
 def test_template_cpu_type_runs_rhel9(tmp_path):

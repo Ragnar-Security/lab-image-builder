@@ -9,6 +9,7 @@ What these tests hold the script to: a run that fails or is interrupted after
 construction marker; and the first-boot user-data snippet is always removed,
 loudly when it cannot be."""
 
+import hashlib
 import json
 import os
 import re
@@ -32,7 +33,11 @@ PVE_CONFIG = (
 )
 DATE = "20261113"
 NAME = f"base-ubuntu-2404-{DATE}"
-NODE_TOOLS = ("qm", "pvesh", "pvesm", "hostname", "sed", "ls", "rm")
+NODE_TOOLS = ("qm", "pvesh", "pvesm", "hostname", "sed", "ls", "rm", "curl")
+# The fake node's cloud image (and what its fake curl downloads) holds these
+# bytes; the tests pass this hash as --sha256 wherever the bytes must match.
+CLOUD_BYTES = b"cloud image"
+CLOUD_SHA = hashlib.sha256(CLOUD_BYTES).hexdigest()
 
 # One program, several roles by the name it runs as:
 #   ssh    root@<host in FAKE_PVE_HOSTS> runs the command line in sh, as the
@@ -48,6 +53,8 @@ NODE_TOOLS = ("qm", "pvesh", "pvesm", "hostname", "sed", "ls", "rm")
 #                           (it appears there) and fails
 #   FAKE_QM_FAIL_ON=<sub>   that qm subcommand fails; "template" converts first
 #   FAKE_RM_FAIL=1          rm of a snippet fails and leaves the file
+#   curl -o <file> <url>    writes FAKE_CURL_BODY (default "cloud image") to
+#                           <file>; FAKE_CURL_FAIL=1 makes it fail (exit 22)
 FAKE_PVE = r'''#!/usr/bin/env python3
 import json, os, shlex, shutil, subprocess, sys, time
 
@@ -96,6 +103,13 @@ if prog == "sed":
     os.execv(real("sed"), ["sed"] + argv)
 if prog == "hostname":
     print(node)
+    sys.exit(0)
+if prog == "curl":
+    if os.environ.get("FAKE_CURL_FAIL"):
+        print("curl: (22) The requested URL returned error: 404", file=sys.stderr)
+        sys.exit(22)
+    with open(argv[argv.index("-o") + 1], "w") as f:
+        f.write(os.environ.get("FAKE_CURL_BODY", "cloud image"))
     sys.exit(0)
 
 path = os.environ["PVE_STATE"]
@@ -238,7 +252,7 @@ def _env(tmp_path: Path, guests=None, **extra) -> dict:
     for tool in NODE_TOOLS:
         (node_bin / tool).symlink_to(fake)
     (tmp_path / "snippets").mkdir()
-    (tmp_path / "noble.img").write_bytes(b"cloud image")
+    (tmp_path / "noble.img").write_bytes(CLOUD_BYTES)
     (tmp_path / "pve-state.json").write_text(json.dumps({"guests": guests or {}}))
     (tmp_path / "config.env").write_text(PVE_CONFIG)
     env = dict(os.environ)
@@ -258,8 +272,8 @@ def _env(tmp_path: Path, guests=None, **extra) -> dict:
 
 
 def _args(tmp_path: Path, *extra):
-    return ["bash", str(SCRIPT), "--image", str(tmp_path / "noble.img"), "--snippets", "snipstore",
-            "--date", DATE, *extra]
+    return ["bash", str(SCRIPT), "--image", str(tmp_path / "noble.img"), "--sha256", CLOUD_SHA,
+            "--snippets", "snipstore", "--date", DATE, *extra]
 
 
 def _run(tmp_path: Path, *extra, guests=None, **env_extra):
@@ -376,15 +390,133 @@ def test_release_names_the_template_and_enables_its_ssh_unit(tmp_path, release):
     assert not (tmp_path / "apply" / "snippets" / f"{name}-user.yaml").exists()
 
 
-@pytest.mark.parametrize("release", sorted(RELEASES))
-def test_release_picks_its_cloud_image_by_default(tmp_path, release):
-    codename = RELEASES[release][1]
-    args = ["bash", str(SCRIPT), "--snippets", "snipstore", "--date", DATE, "--release", release]
-    result = subprocess.run(args, env=_env(tmp_path), capture_output=True, text=True, timeout=120,
-                            stdin=subprocess.DEVNULL)
-    # No such file on the fake node: the error names the path the release chose.
+# --- the cloud image is pinned: a dated URL and its SHA-256, checked fail-closed ---
+
+
+ISO = "/var/lib/vz/template/iso"
+PINS = {
+    # release: (dated release URL, its SHA-256 from that release's SHA256SUMS,
+    #           the file name on the node)
+    "2004": ("https://cloud-images.ubuntu.com/releases/focal/release-20250624/"
+             "ubuntu-20.04-server-cloudimg-amd64.img",
+             "18f2977d77dfea1b74aee14533bd21c34f789139e949c57023b7364894b7e5e9",
+             "focal-server-cloudimg-amd64-20250624.img"),
+    "2204": ("https://cloud-images.ubuntu.com/releases/jammy/release-20261109/"
+             "ubuntu-22.04-server-cloudimg-amd64.img",
+             "77d19e53656f87c95f1f6c6be59c789083b3f77fa08f9d88011ee04085c61f87",
+             "jammy-server-cloudimg-amd64-20261109.img"),
+    # The image base-ubuntu-2404-20261113 was built from.
+    "2404": ("https://cloud-images.ubuntu.com/releases/noble/release-20260911/"
+             "ubuntu-24.04-server-cloudimg-amd64.img",
+             "612b2c0cc1bc413a6cb8c38fd611794caf0f2b436c50013d8b3794db12ad7354",
+             "noble-server-cloudimg-amd64-20260911.img"),
+}
+
+
+def _bare(tmp_path: Path, *extra, **env_extra):
+    """The script without the harness's --image/--sha256."""
+    args = ["bash", str(SCRIPT), "--snippets", "snipstore", "--date", DATE, *extra]
+    return subprocess.run(args, env=_env(tmp_path, **env_extra), capture_output=True, text=True,
+                          timeout=120, stdin=subprocess.DEVNULL)
+
+
+@pytest.mark.parametrize("release", sorted(PINS))
+def test_release_pins_a_dated_cloud_image(tmp_path, release):
+    url, sha, local = PINS[release]
+    result = _bare(tmp_path, "--release", release)
+    # Absent on the node: the dry run plans to fetch the pinned URL to a
+    # dated file name and check it against the pinned hash.
+    assert result.returncode == 0, result.stderr
+    out = result.stderr
+    assert f"{ISO}/{local}" in out and url in out and sha in out, out
+    assert "would run: sh -c" in out and "curl" in out, out
+    assert "/current/" not in out, out
+    assert not any(c.startswith("curl") for c in _cmds(tmp_path)), _cmds(tmp_path)
+
+
+def test_apply_fetches_a_missing_image_and_checks_it(tmp_path):
+    image = tmp_path / "fetched.img"
+    url = PINS["2404"][0]
+    result = _bare(tmp_path, "--apply", "--image", str(image), "--image-url", url,
+                   "--sha256", CLOUD_SHA)
+    assert result.returncode == 0, result.stderr
+    assert image.read_bytes() == CLOUD_BYTES
+    assert not (tmp_path / "fetched.img.part").exists()
+    cmds = _cmds(tmp_path)
+    fetch = [i for i, c in enumerate(cmds) if c.startswith("curl ")]
+    create = [i for i, c in enumerate(cmds) if c.startswith("qm create ")]
+    assert len(fetch) == 1 and url in cmds[fetch[0]], cmds
+    assert create and fetch[0] < create[0], cmds
+    assert _state(tmp_path)["8000"]["template"] == 1
+
+
+def test_fetched_image_with_the_wrong_checksum_fails_closed(tmp_path):
+    # The download is not the pinned bytes: nothing is created and nothing of
+    # the download is kept.
+    image = tmp_path / "fetched.img"
+    url, sha, _ = PINS["2404"]
+    result = _bare(tmp_path, "--apply", "--image", str(image), "--image-url", url, "--sha256", sha)
     assert result.returncode == 1, result.stderr
-    assert f"/var/lib/vz/template/iso/{codename}-server-cloudimg-amd64.img not found" in result.stderr
+    assert sha in result.stderr and CLOUD_SHA in result.stderr, result.stderr
+    assert not image.exists() and not (tmp_path / "fetched.img.part").exists()
+    assert not any(c.startswith("qm ") for c in _cmds(tmp_path)), _cmds(tmp_path)
+    assert _state(tmp_path) == {} and not _snippet(tmp_path).exists()
+
+
+def test_failed_fetch_fails_closed(tmp_path):
+    image = tmp_path / "fetched.img"
+    result = _bare(tmp_path, "--apply", "--image", str(image), "--image-url", PINS["2404"][0],
+                   "--sha256", CLOUD_SHA, FAKE_CURL_FAIL="1")
+    assert result.returncode == 1, result.stderr
+    assert not image.exists() and not (tmp_path / "fetched.img.part").exists()
+    assert not any(c.startswith("qm ") for c in _cmds(tmp_path)), _cmds(tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["dry", "apply"])
+def test_image_on_the_node_with_the_wrong_checksum_fails_closed(tmp_path, mode):
+    apply = ("--apply",) if mode == "apply" else ()
+    # No --sha256: the release's pin applies, and the node's file is not it.
+    pinned = _bare(tmp_path / "pinned", *apply, "--image", str(tmp_path / "pinned" / "noble.img"))
+    assert pinned.returncode == 1, pinned.stderr
+    assert PINS["2404"][1] in pinned.stderr and CLOUD_SHA in pinned.stderr, pinned.stderr
+    assert not any(c.startswith("qm ") for c in _cmds(tmp_path / "pinned"))
+    # An explicit --sha256 that the file does not match.
+    other = "0" * 64
+    wrong = _bare(tmp_path / "wrong", *apply, "--image", str(tmp_path / "wrong" / "noble.img"),
+                  "--sha256", other)
+    assert wrong.returncode == 1 and other in wrong.stderr, wrong.stderr
+    assert not any(c.startswith("qm ") for c in _cmds(tmp_path / "wrong"))
+
+
+@pytest.mark.parametrize("url", [
+    # moving names
+    "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+    "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img",
+    "https://example.invalid/latest/ubuntu-24.04-server-cloudimg-amd64.img",
+    # not https
+    "http://cloud-images.ubuntu.com/releases/noble/release-20260911/ubuntu-24.04-server-cloudimg-amd64.img",
+    # another release's image under --release 2404
+    "https://cloud-images.ubuntu.com/releases/focal/release-20250624/ubuntu-20.04-server-cloudimg-amd64.img",
+])
+def test_unpinned_image_url_is_refused_before_the_node_is_reached(tmp_path, url):
+    result = _bare(tmp_path, "--image-url", url, "--sha256", CLOUD_SHA)
+    assert result.returncode == 1, result.stderr
+    assert "--image-url" in result.stderr, result.stderr
+    assert not (tmp_path / "calls.log").exists()
+
+
+def test_image_url_needs_its_sha256(tmp_path):
+    result = _bare(tmp_path, "--image-url", PINS["2404"][0])
+    assert result.returncode == 1 and "--sha256" in result.stderr, result.stderr
+    assert not (tmp_path / "calls.log").exists()
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "0" * 63, "G" * 64, CLOUD_SHA.upper()])
+def test_sha256_must_be_64_lowercase_hex(tmp_path, bad):
+    result = _bare(tmp_path, "--image", str(tmp_path / "noble.img"), "--sha256", bad)
+    assert result.returncode == 1, result.stderr
+    assert "--sha256" in result.stderr, result.stderr
+    assert not (tmp_path / "calls.log").exists()
 
 
 def test_release_defaults_to_2404(tmp_path):

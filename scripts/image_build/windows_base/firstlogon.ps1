@@ -20,8 +20,11 @@ try {
     Write-Output "virtio-win ISO at $v"
 
     # The publisher of the driver catalogs is trusted first, so a quiet
-    # install never waits on a driver-trust prompt.
-    $signer = (Get-AuthenticodeSignature -FilePath (Join-Path $v 'NetKVM\2k22\amd64\netkvm.cat')).SignerCertificate
+    # install never waits on a driver-trust prompt. The catalog is the one
+    # for this Windows release (virtio-win's 2k16, 2k19, 2k22 directories).
+    $release = @{ 14393 = '2k16'; 17763 = '2k19' }[[Environment]::OSVersion.Version.Build]
+    if (-not $release) { $release = '2k22' }
+    $signer = (Get-AuthenticodeSignature -FilePath (Join-Path $v "NetKVM\$release\amd64\netkvm.cat")).SignerCertificate
     if ($signer) {
         $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('TrustedPublisher', 'LocalMachine')
         $store.Open('ReadWrite'); $store.Add($signer); $store.Close()

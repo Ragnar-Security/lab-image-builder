@@ -1222,7 +1222,17 @@ def test_windows_remote_commands(tmp_path):
                for l in ssh), ssh
     scp = _remote_commands(calls, "scp")
     assert any(l.endswith(" Administrator@192.0.2.10:C:/image-build/payload.tgz") for l in scp), scp
+    assert any(l.endswith(" Administrator@192.0.2.10:C:/image-build/expand_payload.ps1") for l in scp), scp
     assert any(l.endswith(" Administrator@192.0.2.10:C:/image-build/seal_windows.ps1") for l in scp), scp
+    # tar.exe where Windows has it (Server 2019 and later), expand_payload.ps1 where it does not.
+    extract = [l for l in ssh if "payload.tgz" in l and "-xzf" in l]
+    assert len(extract) == 1, ssh
+    assert ("if (Get-Command tar.exe -ErrorAction SilentlyContinue) "
+            "{ tar.exe -xzf C:\\image-build\\payload.tgz -C C:\\image-build } "
+            "else { & C:\\image-build\\expand_payload.ps1 -Archive C:\\image-build\\payload.tgz "
+            "-Destination C:\\image-build }; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }") in extract[0], extract
+    remove = [l for l in ssh if "Remove-Item" in l and "payload.tgz" in l]
+    assert len(remove) == 1 and "Remove-Item -Force C:\\image-build\\expand_payload.ps1" in remove[0], ssh
     assert _events(calls, "setup.ps1", "verify.ps1", "seal_windows.ps1") == [
         "check_config", "resolve_base", "start", "upload", "setup", "verify", "seal", "save", "destroy"]
     assert "sudo" not in "".join(ssh)
@@ -1441,6 +1451,7 @@ UPLOAD_STEPS = {
               ("ssh", "rm -f /tmp/image-build/payload.tgz")),
     "windows": (("ssh", "New-Item -ItemType Directory -Force -Path C:\\image-build"),
                 ("scp", ":C:/image-build/payload.tgz"),
+                ("scp", ":C:/image-build/expand_payload.ps1"),
                 ("ssh", "tar.exe -xzf C:\\image-build\\payload.tgz"),
                 ("ssh", "Remove-Item -Force C:\\image-build\\payload.tgz")),
 }

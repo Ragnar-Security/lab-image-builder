@@ -1,0 +1,160 @@
+hashing <TMP>/isos/Windows_Server_2022_EVAL.iso (a few minutes over NFS)
+== Windows base template: dry run (nothing will change) ==
+VM 8000 'base-ws2022-20261113' on pve: disk 40G on build-store, net0 vmbrtest VLAN 999 (DHCP)
+  install:   local:iso/Windows_Server_2022_EVAL.iso (sha256 66f53c068fa72b403080fc864c14197bc3756f921a5f5f5123334bb90e2cfb73)
+  virtio:    local:iso/virtio-win-0.1.302.iso (sha256 ed0e5a8dd951b897dd4b935bba2597238fee37f4ac3e34f6727bb3f9231e62cb)
+  answer:    local:iso/base-ws2022-20261113-answer.iso (this run's; deleted afterwards)
+  updates:   Windows Update until none is left (at most 8 rounds)
+  pve MemAvailable: 32 GiB
+  guests in 8000-8999 now: none
+  marker:    proxmox-base-build=<MARKER> (in the description until the VM is a template)
+would write <TMP>/isos/base-ws2022-20261113-answer.iso from /tmp/base-ws2022-20261113-answer.<PID>: autounattend.xml (password elided), BASEBUILD.TAG, firstlogon.ps1 step.ps1 prepare.ps1 windows_update.ps1 cleanup.ps1 finalize.ps1 sysprep-unattend.xml randomize-admin.ps1 SetupComplete.cmd
+    <?xml version="1.0" encoding="utf-8"?>
+    <!--
+      Unattended install of the Proxmox Windows base (proxmox_base_windows.sh).
+      Windows Server 2022 Standard Evaluation (Desktop Experience) on the virtio-scsi
+      disk scsi0, one MBR partition (SeaBIOS). The password placeholder is replaced by a
+      random value per run; this file lives only on the run's own ISO, which the
+      script deletes, and sysprep replaces the password with another random one.
+      The virtio-win ISO's drive letter is not fixed in Windows PE, so the driver
+      paths are listed for D: to I:; a path that does not exist is skipped.
+    -->
+    <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+    
+      <settings pass="windowsPE">
+        <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64"
+                   publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+          <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+          <InputLocale>en-US</InputLocale>
+          <SystemLocale>en-US</SystemLocale>
+          <UILanguage>en-US</UILanguage>
+          <UserLocale>en-US</UserLocale>
+        </component>
+    
+        <component name="Microsoft-Windows-PnpCustomizationsWinPE" processorArchitecture="amd64"
+                   publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+          <DriverPaths>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="1"><Path>D:\vioscsi\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="2"><Path>E:\vioscsi\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="3"><Path>F:\vioscsi\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="4"><Path>G:\vioscsi\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="5"><Path>H:\vioscsi\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="6"><Path>I:\vioscsi\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="7"><Path>D:\NetKVM\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="8"><Path>E:\NetKVM\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="9"><Path>F:\NetKVM\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="10"><Path>G:\NetKVM\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="11"><Path>H:\NetKVM\2k22\amd64</Path></PathAndCredentials>
+            <PathAndCredentials wcm:action="add" wcm:keyValue="12"><Path>I:\NetKVM\2k22\amd64</Path></PathAndCredentials>
+          </DriverPaths>
+        </component>
+    
+        <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
+                   publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+          <DiskConfiguration>
+            <WillShowUI>OnError</WillShowUI>
+            <Disk wcm:action="add">
+              <DiskID>0</DiskID>
+              <WillWipeDisk>true</WillWipeDisk>
+              <CreatePartitions>
+                <CreatePartition wcm:action="add">
+                  <Order>1</Order><Type>Primary</Type><Extend>true</Extend>
+                </CreatePartition>
+              </CreatePartitions>
+              <ModifyPartitions>
+                <ModifyPartition wcm:action="add">
+                  <Order>1</Order><PartitionID>1</PartitionID>
+                  <Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter><Active>true</Active>
+                </ModifyPartition>
+              </ModifyPartitions>
+            </Disk>
+          </DiskConfiguration>
+          <ImageInstall>
+            <OSImage>
+              <InstallFrom>
+                <MetaData wcm:action="add">
+                  <Key>/IMAGE/NAME</Key>
+                  <Value>Windows Server 2022 SERVERSTANDARD</Value>
+                </MetaData>
+              </InstallFrom>
+              <InstallTo><DiskID>0</DiskID><PartitionID>1</PartitionID></InstallTo>
+              <WillShowUI>OnError</WillShowUI>
+            </OSImage>
+          </ImageInstall>
+          <UserData>
+            <AcceptEula>true</AcceptEula>
+            <ProductKey><WillShowUI>OnError</WillShowUI></ProductKey>
+          </UserData>
+        </component>
+      </settings>
+    
+      <settings pass="specialize">
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+                   publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+          <ComputerName>*</ComputerName>
+          <TimeZone>UTC</TimeZone>
+        </component>
+        <component name="Microsoft-Windows-ServerManager-SvrMgrNc" processorArchitecture="amd64"
+                   publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+          <DoNotOpenServerManagerAtLogon>true</DoNotOpenServerManagerAtLogon>
+        </component>
+      </settings>
+    
+      <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64"
+                   publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+          <InputLocale>en-US</InputLocale>
+          <SystemLocale>en-US</SystemLocale>
+          <UILanguage>en-US</UILanguage>
+          <UserLocale>en-US</UserLocale>
+        </component>
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+                   publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+          <OOBE>
+            <HideEULAPage>true</HideEULAPage>
+            <HideLocalAccountScreen>true</HideLocalAccountScreen>
+            <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+            <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+            <ProtectYourPC>3</ProtectYourPC>
+          </OOBE>
+          <UserAccounts>
+            <AdministratorPassword>
+              <Value><random, never printed></Value>
+              <PlainText>true</PlainText>
+            </AdministratorPassword>
+          </UserAccounts>
+          <!-- One automatic logon runs the first-logon script from the run's ISO:
+               virtio drivers and the QEMU guest agent. The rest is done through the
+               agent. -->
+          <AutoLogon>
+            <Enabled>true</Enabled>
+            <Username>Administrator</Username>
+            <LogonCount>1</LogonCount>
+            <Password>
+              <Value><random, never printed></Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </AutoLogon>
+          <FirstLogonCommands>
+            <SynchronousCommand wcm:action="add">
+              <Order>1</Order>
+              <CommandLine>cmd.exe /c for %d in (D E F G H I J) do @if exist %d:\BASEBUILD.TAG powershell.exe -NoProfile -ExecutionPolicy Bypass -File %d:\firstlogon.ps1</CommandLine>
+              <Description>virtio drivers and QEMU guest agent</Description>
+              <RequiresUserInput>false</RequiresUserInput>
+            </SynchronousCommand>
+          </FirstLogonCommands>
+        </component>
+      </settings>
+    </unattend>
+would run: qm create 8000 --name base-ws2022-20261113 --ostype win11 --localtime 0 --cores 4 --memory 8192 --agent enabled=1 --scsihw virtio-scsi-single --scsi0 build-store:40,discard=on --ide2 local:iso/Windows_Server_2022_EVAL.iso,media=cdrom --ide0 local:iso/virtio-win-0.1.302.iso,media=cdrom --ide3 local:iso/base-ws2022-20261113-answer.iso,media=cdrom --net0 virtio,bridge=vmbrtest,tag=999 --boot 'order=scsi0;ide2' --description 'proxmox-base-build=<MARKER> base-ws2022-20261113 under construction by proxmox_base_windows.sh; not a template yet'
+would run: qm start 8000
+would wait for the guest agent (installed by the first automatic logon), then run as SYSTEM
+  through the agent: step prepare; Windows Update rounds (reboot when asked); step cleanup;
+  reboot; step finalize; sysprep /generalize /oobe /shutdown /mode:vm; wait for 'stopped'.
+would run: qm set 8000 --delete ide0,ide2,ide3
+would run: qm set 8000 --memory 4096 --cores 2 --boot order=scsi0
+would run: qm template 8000
+would run: qm set 8000 --description 'base-ws2022-20261113: Windows Server 2022 Standard Evaluation (Desktop Experience) from Windows_Server_2022_EVAL.iso sha256 66f53c068fa72b403080fc864c14197bc3756f921a5f5f5123334bb90e2cfb73, virtio-win virtio-win-0.1.302.iso sha256 ed0e5a8dd951b897dd4b935bba2597238fee37f4ac3e34f6727bb3f9231e62cb, Windows Update applied, built <TODAY> by scripts/image_build/proxmox_base_windows.sh. Sysprepped (generalize, oobe, mode:vm). Administrator only, random unrecorded password. OpenSSH Server, key login only, no keys; sshd starts after first-boot setup. QEMU guest agent. Evaluation licence.'
+would run: rm -f <TMP>/isos/base-ws2022-20261113-answer.iso
+
+Dry run only. Re-run with --apply to create template 8000.

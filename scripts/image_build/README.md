@@ -319,6 +319,19 @@ is passed (which the core does for `KEEP_SSH=yes`).
   (`windows-cloud/windows-2022`), `AZURE_DISK_GB=127` (the Windows Server
   marketplace images); on AWS the root disk must be at least 30
   (`AWS_DISK_GB` if `DISK_GB` is smaller).
+- The payload reaches `C:\image-build` as `payload.tgz`, with
+  `expand_payload.ps1` beside it. It is extracted with `tar.exe` where
+  Windows has it (Server 2019 and later); where it does not (Server 2016 and
+  older), `expand_payload.ps1` extracts it with .NET: regular files and
+  directories in GNU tar, pax or ustar form, with long names. Before it
+  writes anything it decompresses the whole archive once and checks it
+  against the gzip trailer (CRC-32 and length), so a truncated or damaged
+  archive extracts nothing. It refuses links, devices, absolute paths, paths
+  that leave `C:\image-build` or are not valid Windows paths, a tar header
+  whose checksum does not match and a tar stream that ends early: such a
+  payload fails the build at the upload.
+  Both files are deleted after the extract, so a payload may not hold either
+  name at its root.
 - `seal_windows.ps1` deletes `C:\image-build` and
   `C:\ProgramData\ssh\administrators_authorized_keys`, then sets the local
   `Administrator` password to a random 32-character value generated in the
@@ -705,25 +718,61 @@ see "Host SSH".
 
 #### Building the Windows base: `proxmox_base_windows.sh`
 
-`scripts/image_build/proxmox_base_windows.sh` builds `base-ws2022-<yyyymmdd>`:
-Windows Server 2022 Standard Evaluation (Desktop Experience), installed
-unattended from the evaluation ISO onto a 40 G virtio-scsi `scsi0` (so
-Windows recipes set `DISK_GB=40`). It runs where `proxmox_base_ubuntu.sh`
+`scripts/image_build/proxmox_base_windows.sh` builds `base-<os>-<yyyymmdd>`:
+Windows Server 2022, 2019 or 2016 Standard Evaluation (Desktop Experience),
+installed unattended from the evaluation ISO onto a 40 G virtio-scsi `scsi0`
+(so Windows recipes set `DISK_GB=40`). It runs where `proxmox_base_ubuntu.sh`
 runs, reads the same five `PVE_` keys, and is a dry run unless given
 `--apply`. The guest-side files are in `scripts/image_build/windows_base/`.
 
 ```
-scripts/image_build/proxmox_base_windows.sh [--iso VOLID] [--virtio-iso VOLID]   # dry run
-scripts/image_build/proxmox_base_windows.sh --apply [--vmid N] [--skip-updates]
+scripts/image_build/proxmox_base_windows.sh [--os ws2022|ws2019|ws2016] [--iso VOLID] [--virtio-iso VOLID]   # dry run
+scripts/image_build/proxmox_base_windows.sh --apply [--os OS] [--vmid N] [--skip-updates]
 ```
 
-Options: `--iso` (default `local:iso/Windows_Server_2022_EVAL.iso`),
+Options: `--os` (default `ws2022`), `--iso` (default
+`local:iso/Windows_Server_<year>_EVAL.iso` for the `--os` release),
 `--virtio-iso` (default `local:iso/virtio-win-0.1.302.iso`; pass both when
 the ISOs sit on another storage), `--iso-store` (a storage with the `iso`
 content type for the run's own answer-file ISO, default `local`), `--vmid`,
 `--date`, `--disk` (default `40G`) and `--skip-updates`. VMID choice, the
 16 GiB memory floor, the construction marker and the cleanup on failure
 work as for the Linux base.
+
+**`--os`.** The release selects four things, and nothing else changes:
+
+| `--os` | image installed from the ISO | virtio-win drivers | Proxmox `ostype` | OpenSSH Server |
+|---|---|---|---|---|
+| `ws2022` | `Windows Server 2022 SERVERSTANDARD` | `2k22` | `win11` | `OpenSSH.Server` capability |
+| `ws2019` | `Windows Server 2019 SERVERSTANDARD` | `2k19` | `win10` | `OpenSSH.Server` capability |
+| `ws2016` | `Windows Server 2016 SERVERSTANDARD` | `2k16` | `win10` | pinned Win32-OpenSSH MSI |
+
+The image name is the evaluation ISO's `install.wim` name for Standard with
+Desktop Experience; each of the three evaluation ISOs holds Standard and
+Datacenter, Core and Desktop Experience. `--os ws2022` prints and does
+exactly what the script did before `--os` existed (a test holds its dry run
+to a recorded copy).
+
+Windows Server 2016 differs in three ways that matter here, and the base
+closes each:
+
+- **No OpenSSH capability.** `prepare.ps1` runs `install-openssh.ps1`
+  instead, which downloads one pinned Win32-OpenSSH release
+  (`OpenSSH-Win64-v10.0.0.0.msi` from the `10.0.0.0p2-Preview` release on
+  GitHub) over the build network, installs it only if its SHA-256 equals the
+  pin, and otherwise stops the build with no installer left behind. The MSI
+  installs to `C:\Program Files\OpenSSH`; the rest of `prepare.ps1`
+  configures it exactly as it configures the capability (it finds `sshd.exe`
+  from the service). To move the pin, change the URL and the hash together;
+  `IMAGE_BUILD_NETWORK_TESTS=1 python -m pytest tests/test_image_build_powershell.py`
+  checks the pin against the published file.
+- **TLS 1.2 is not a .NET default.** Windows PowerShell 5.1 on Server 2016
+  offers SSL 3 and TLS 1.0 only, which GitHub and most download sites refuse.
+  `prepare.ps1` sets `SchUseStrongCrypto` and `SystemDefaultTlsVersions` for
+  .NET 4 (64- and 32-bit), and fails unless a new PowerShell then offers
+  TLS 1.2. Where a new PowerShell already offers it, it changes nothing.
+- **No `tar.exe`.** The core's payload extract uses `tar.exe` where Windows
+  has it and otherwise `expand_payload.ps1` (see "Windows recipes").
 
 **What it does.** It writes a per-run ISO holding `autounattend.xml` (with a
 random install password) and the guest scripts, creates the VM (SeaBIOS,
@@ -735,11 +784,12 @@ the QEMU guest agent. Everything else runs as SYSTEM through the agent, each
 long step as a scheduled task (`windows_base/step.ps1`) so the agent's
 command timeout does not apply:
 
-1. `prepare.ps1`: installs OpenSSH Server (`Add-WindowsCapability`, which
-   needs internet), turns password login off, leaves the default shell as
-   `cmd.exe` (the core's Windows commands expect it), opens `tcp/22` on every
-   firewall profile, and proves that `sshd` writes new host keys when they are
-   missing.
+1. `prepare.ps1`: turns TLS 1.2 on for .NET where it is off, installs
+   OpenSSH Server (`Add-WindowsCapability`, which needs internet, or on
+   Server 2016 the pinned MSI), turns password login off, leaves the default
+   shell as `cmd.exe` (the core's Windows commands expect it), opens `tcp/22`
+   on every firewall profile, and proves that `sshd` writes new host keys
+   when they are missing.
 2. `windows_update.ps1`, in rounds until no update is left, rebooting when
    one asks (`--skip-updates` skips this; the description then says so).
    After every reboot the script waits for the guest to settle: Windows
@@ -785,10 +835,16 @@ the cryptographic RNG, held in a `SecureString` and never output. Every
 clone therefore has its own unrecorded password; the builder logs in with a
 key, and the seal sets yet another.
 
-**Licence.** Evaluation edition. The base was activated (180 days) before
+**Licence.** Evaluation edition. The base is activated (180 days) before
 sysprep, which resets that: a fresh clone starts in a 10-day initial grace
-period (`slmgr /dlv`), and `slmgr /ato` on a clone returned `0x80041008` on
-2026-11-14, so online activation of a clone is not proven. Built images are
+period (`slmgr /dlv`). On the updated `ws2022` base of 2026-11-14,
+`slmgr /ato` on a clone returned `0x80041008`, so online activation of that
+lineage is not proven. On the un-updated `ws2016` base, `slmgr /ato` on a
+fresh clone activates it for 180 days, provided the activation host
+resolves: run straight after first boot it failed with `0x80072EE7` (name
+not resolved), so a recipe that activates should first wait until
+`activation-v2.sls.microsoft.com` resolves and retry `/ato` a few times on
+`0x80072EE7`, `0x80072EFD`, `0x80072EE2` or `0x8007232B`. Built images are
 not sysprepped and keep their build VM's licence state; check `slmgr /dlv`
 on a built image before relying on it for a term.
 

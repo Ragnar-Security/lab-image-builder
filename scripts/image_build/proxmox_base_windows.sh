@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 #
 # Create the Proxmox base template for Windows image builds,
-# base-ws2022-<yyyymmdd>: Windows Server 2022 Standard Evaluation (Desktop
-# Experience), installed unattended from the evaluation ISO, updated, and
-# sysprepped. Runs on the build host, next to config.env, and reaches PVE_HOST
-# as root over SSH (key auth), as build_image.sh does.
+# base-<os>-<yyyymmdd>: Windows Server 2022, 2019 or 2016 Standard Evaluation
+# (Desktop Experience), installed unattended from the evaluation ISO,
+# updated, and sysprepped. Runs on the build host, next to config.env, and
+# reaches PVE_HOST as root over SSH (key auth), as build_image.sh does.
 #
 # Usage: scripts/image_build/proxmox_base_windows.sh [--apply] [options]
+#   --os ws2022|ws2019|ws2016
+#                       Windows Server release (default ws2022). Selects the
+#                       image in the ISO (Windows Server <year>
+#                       SERVERSTANDARD), the virtio-win driver directory
+#                       (2k22, 2k19, 2k16), the default --iso and the name.
+#                       ws2016 has no OpenSSH capability: the base installs a
+#                       pinned Win32-OpenSSH release instead
+#                       (windows_base/install-openssh.ps1)
 #   --iso VOLID         installation ISO
-#                       (default local:iso/Windows_Server_2022_EVAL.iso)
+#                       (default local:iso/Windows_Server_<year>_EVAL.iso)
 #   --virtio-iso VOLID  virtio-win ISO (default local:iso/virtio-win-0.1.302.iso)
 #   --iso-store STORE   storage with the `iso` content type for the run's own
 #                       answer-file ISO, deleted afterwards (default local)
@@ -74,7 +82,8 @@ GUEST_FILES=(firstlogon.ps1 step.ps1 prepare.ps1 windows_update.ps1 cleanup.ps1 
              sysprep-unattend.xml randomize-admin.ps1 SetupComplete.cmd)
 
 APPLY=0
-ISO=local:iso/Windows_Server_2022_EVAL.iso
+OS_ID=ws2022
+ISO=""
 VIRTIO_ISO=local:iso/virtio-win-0.1.302.iso
 ISO_STORE=local
 VMID=""
@@ -101,6 +110,9 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --apply) APPLY=1 ;;
         --dry-run) APPLY=0 ;;
+        --os)
+            [ $# -ge 2 ] || { printf 'ERROR: --os needs ws2022, ws2019 or ws2016\n' >&2; exit 2; }
+            OS_ID="$2"; shift ;;
         --iso) ISO="${2:?--iso needs a volume ID}"; shift ;;
         --virtio-iso) VIRTIO_ISO="${2:?--virtio-iso needs a volume ID}"; shift ;;
         --iso-store) ISO_STORE="${2:?--iso-store needs a storage}"; shift ;;
@@ -108,11 +120,25 @@ while [ $# -gt 0 ]; do
         --date) DATE="${2:?--date needs YYYYMMDD}"; shift ;;
         --disk) DISK="${2:?--disk needs a size}"; shift ;;
         --skip-updates) UPDATES=0 ;;
-        -h|--help) sed -n '3,61p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        # The help is the header comment, up to its first blank line.
+        -h|--help) sed -n '3,/^$/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'ERROR: unknown option %s\n' "$1" >&2; exit 2 ;;
     esac
     shift
 done
+
+# --- the Windows Server release ---------------------------------------------
+# YEAR names the image in the ISO and the default ISO; VIRTIO_DIR is the
+# virtio-win driver directory for that release; OSTYPE is Proxmox's.
+case "$OS_ID" in
+    ws2022) YEAR=2022 VIRTIO_DIR=2k22 OSTYPE=win11 ;;
+    ws2019) YEAR=2019 VIRTIO_DIR=2k19 OSTYPE=win10 ;;
+    ws2016) YEAR=2016 VIRTIO_DIR=2k16 OSTYPE=win10
+        # No OpenSSH.Server capability on Server 2016 (prepare.ps1).
+        GUEST_FILES+=(install-openssh.ps1) ;;
+    *) printf "ERROR: --os must be one of ws2022, ws2019, ws2016 (got '%s')\n" "$OS_ID" >&2; exit 2 ;;
+esac
+ISO="${ISO:-local:iso/Windows_Server_${YEAR}_EVAL.iso}"
 
 # --- config: only the PVE_ keys come back, as in build_image.sh ------------
 [ -f "$CONFIG" ] || die "config $CONFIG does not exist"
@@ -151,7 +177,7 @@ for f in autounattend.xml.in "${GUEST_FILES[@]}"; do
     [ -f "$FILES_DIR/$f" ] || die "$FILES_DIR/$f is missing"
 done
 
-NAME="base-ws2022-$DATE"
+NAME="base-$OS_ID-$DATE"
 GEN_ISO_FILE="$NAME-answer.iso"
 GEN_ISO="$ISO_STORE:iso/$GEN_ISO_FILE"
 
@@ -399,12 +425,19 @@ while True:
         print(p)
         break
 ')"
+# autounattend.xml for this release: @@YEAR@@ and @@VIRTIO_DIR@@ first, then
+# the password, so nothing in a password is read as a placeholder.
 answer_file() {
-    PW="$1" py '
-import os, sys
+    PW="$1" YEAR="$YEAR" VIRTIO_DIR="$VIRTIO_DIR" py '
+import os, re, sys
 t = open(sys.argv[1], encoding="utf-8").read()
-if "@@ADMIN_PASSWORD@@" not in t:
-    sys.exit("no @@ADMIN_PASSWORD@@ in " + sys.argv[1])
+for key in ("YEAR", "VIRTIO_DIR", "ADMIN_PASSWORD"):
+    if "@@%s@@" % key not in t:
+        sys.exit("no @@%s@@ in %s" % (key, sys.argv[1]))
+t = t.replace("@@YEAR@@", os.environ["YEAR"]).replace("@@VIRTIO_DIR@@", os.environ["VIRTIO_DIR"])
+left = sorted(set(re.findall(r"@@[A-Z_]+@@", t)) - {"@@ADMIN_PASSWORD@@"})
+if left:
+    sys.exit("unknown placeholder(s) %s in %s" % (", ".join(left), sys.argv[1]))
 sys.stdout.write(t.replace("@@ADMIN_PASSWORD@@", os.environ["PW"]))
 ' "$FILES_DIR/autounattend.xml.in"
 }
@@ -548,7 +581,7 @@ VM_ARMED="$APPLY"
 # The RTC in UTC (Proxmox's default for Windows is the node's local time):
 # Windows runs in UTC here, so it boots with the right clock instead of
 # stepping it at the first time sync.
-run qm create "$VMID" --name "$NAME" --ostype win11 --localtime 0 --cores "$BUILD_CORES" --memory "$BUILD_MEMORY" \
+run qm create "$VMID" --name "$NAME" --ostype "$OSTYPE" --localtime 0 --cores "$BUILD_CORES" --memory "$BUILD_MEMORY" \
     --agent enabled=1 --scsihw virtio-scsi-single --scsi0 "$PVE_STORAGE:$DISK_GIB,discard=on" \
     --ide2 "$ISO,media=cdrom" --ide0 "$VIRTIO_ISO,media=cdrom" --ide3 "$GEN_ISO,media=cdrom" \
     --net0 "virtio,bridge=$PVE_BUILD_BRIDGE,tag=$PVE_BUILD_VLAN" --boot 'order=scsi0;ide2' \
@@ -652,7 +685,7 @@ fi
 run qm template "$VMID"
 # A template is finished: from here a failure is reported, never destroyed.
 VM_ARMED=0
-run qm set "$VMID" --description "$NAME: Windows Server 2022 Standard Evaluation (Desktop Experience) from $(basename "$iso_path") sha256 $iso_sha, virtio-win $(basename "$virtio_path") sha256 $virtio_sha, $([ "$UPDATES" -eq 1 ] && echo 'Windows Update applied' || echo 'NO Windows Update'), built $(date -u +%Y-%m-%d) by scripts/image_build/proxmox_base_windows.sh. Sysprepped (generalize, oobe, mode:vm). Administrator only, random unrecorded password. OpenSSH Server, key login only, no keys; sshd starts after first-boot setup. QEMU guest agent. Evaluation licence." \
+run qm set "$VMID" --description "$NAME: Windows Server $YEAR Standard Evaluation (Desktop Experience) from $(basename "$iso_path") sha256 $iso_sha, virtio-win $(basename "$virtio_path") sha256 $virtio_sha, $([ "$UPDATES" -eq 1 ] && echo 'Windows Update applied' || echo 'NO Windows Update'), built $(date -u +%Y-%m-%d) by scripts/image_build/proxmox_base_windows.sh. Sysprepped (generalize, oobe, mode:vm). Administrator only, random unrecorded password. OpenSSH Server, key login only, no keys; sshd starts after first-boot setup. QEMU guest agent. Evaluation licence." \
     || die "template $VMID is finished, but setting its description failed; it still reads 'under construction' with $RUN_TAG: set it by hand (qm set $VMID --description ...)"
 if [ "$APPLY" -eq 1 ]; then
     remove_iso || exit 1

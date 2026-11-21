@@ -85,6 +85,18 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Two optional parts of the backend contract: `BACKEND_RECIPE_KEYS` (recipe
   keys a backend requires) and `backend_reboot` (a backend's own reboot for
   a setup that exits 100).
+- `proxmox_base_windows.sh --os ws2022|ws2019|ws2016` (default `ws2022`,
+  unchanged) builds `base-<os>-<yyyymmdd>` from that release's evaluation
+  ISO: the image name, the virtio-win driver directory, the default `--iso`
+  and the Proxmox `ostype` follow the release. Server 2016 has no OpenSSH
+  capability, so its base installs one pinned Win32-OpenSSH MSI
+  (`windows_base/install-openssh.ps1`), only if its SHA-256 matches the pin;
+  and where .NET offers no TLS 1.2 by default the base turns it on.
+- `expand_payload.ps1`: on a Windows build VM without `tar.exe` (Server 2016
+  and older) the core extracts the payload with .NET instead. It checks the
+  whole gzip stream against its trailer (CRC-32 and length) before writing
+  anything, and refuses links, paths outside the payload directory and
+  damaged tar headers.
 
 ### Changed
 

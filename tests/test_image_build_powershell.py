@@ -12,6 +12,7 @@ import gzip
 import hashlib
 import http.server
 import io
+import json
 import os
 import re
 import shutil
@@ -306,12 +307,25 @@ def test_openssh_pin_matches_the_published_release(tmp_path):
 
 
 # --- finalize.ps1 (the Windows base's last step before sysprep) -------------------
-# Its app cleanup and its sshd stop run against stand-in cmdlets: functions of
-# the same names, which PowerShell resolves before the real cmdlets. The script
-# is dot-sourced with -FunctionsOnly, which returns before any step runs; the
-# guard below refuses to load a finalize.ps1 that would run its steps here.
+# Its app cleanup and its sshd stop run on output captured from real Windows
+# machines (tests/fixtures/image_build/windows/, each file says when, where and
+# how it was captured), replayed into the production functions:
+#   - appx-ws2016-14393.json: the Server 2016 base build VM, after `prepare`
+#     (its Administrator had logged on once), as SYSTEM, as finalize sees it;
+#   - appx-ws2022-20348.json: a fresh clone of the updated Server 2022 base;
+#   - sshd-ws2016-14393.json: sshd on the Server 2016 build VM through the
+#     post-cleanup reboot and finalize, and on a clone of the new base: the
+#     statuses after a start and a stop, Stop-Service on a starting service,
+#     and the exception WaitForStatus throws on a timeout.
+# Get-AppxPackage, Get-Service and the rest become functions that return the
+# captured values (PowerShell resolves a function before a cmdlet of the same
+# name); Remove-AppxPackage is generated with exactly the captured parameter
+# set, so PowerShell's own binder accepts or refuses -AllUsers as Windows did.
+# finalize.ps1 is dot-sourced with -FunctionsOnly, which returns before any
+# step; the guard below refuses to load one that would run its steps here.
 
 FINALIZE = IMAGE_BUILD / "windows_base" / "finalize.ps1"
+CAPTURED = ROOT / "tests" / "fixtures" / "image_build" / "windows"
 
 
 def _finalize(tmp_path: Path, body: str):
@@ -323,142 +337,202 @@ def _finalize(tmp_path: Path, body: str):
     script = tmp_path / "harness.ps1"
     script.write_text("$ErrorActionPreference = 'Stop'\n"
                       f". '{FINALIZE}' -FunctionsOnly\n" + body, encoding="utf-8")
-    return subprocess.run(_powershell() + ["-File", str(script)], capture_output=True, text=True, timeout=120)
+    result = subprocess.run(_powershell() + ["-File", str(script)], capture_output=True, text=True, timeout=120)
+    return result, result.stdout + result.stderr
 
 
-# Package objects as Get-AppxPackage -AllUsers returns them. Server 2016's have
-# no NonRemovable property; Server 2019's and 2022's do.
-APPX = r'''
-function Pkg($name, $sig, $loc, [bool]$framework, $nonRemovable) {
-    $p = [ordered]@{ Name = $name; PackageFullName = "${name}_1.0_neutral__x"; SignatureKind = $sig
-        InstallLocation = $loc; IsFramework = $framework
-        PackageUserInformation = @([pscustomobject]@{ InstallState = 'Installed' }) }
-    if ($null -ne $nonRemovable) { $p.NonRemovable = [bool]$nonRemovable }
-    [pscustomobject]$p
-}
-$sys = "$env:windir\SystemApps\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy"
-$store = 'C:\Program Files\WindowsApps\Example.App_1.0_x64__x'
+# The captured inventory as package objects with exactly the properties the
+# capture saw (Server 2016's have no NonRemovable), and Remove-AppxPackage with
+# exactly the captured parameters; a call is recorded, nothing is removed.
+APPX_REPLAY = r'''
+$cap = Get-Content -Raw -Encoding UTF8 -LiteralPath '__FIXTURE__' | ConvertFrom-Json
+$fields = 'Name', 'PackageFullName', 'SignatureKind', 'InstallLocation', 'IsFramework', 'NonRemovable', 'PackageUserInformation'
+$packages = @(foreach ($p in $cap.Packages) {
+    $h = [ordered]@{}
+    foreach ($f in $fields) { if (@($p.Properties) -contains $f) { $h[$f] = $p.$f } }
+    [pscustomobject]$h
+})
+$provisioned = @($cap.ProvisionedNames)
+$common = @([System.Management.Automation.PSCmdlet]::CommonParameters) + @([System.Management.Automation.PSCmdlet]::OptionalCommonParameters)
+$params = @($cap.RemoveAppxPackageParameters | Where-Object { $common -notcontains $_.Name } |
+    ForEach-Object { if ($_.Type -eq 'System.Management.Automation.SwitchParameter') { "[switch]`$$($_.Name)" } else { "[object]`$$($_.Name)" } })
 $script:removed = @()
+Invoke-Expression ("function Remove-AppxPackage { [CmdletBinding()] param(" + ($params -join ', ') +
+    ") `$script:removed += ('{0} allusers={1}' -f `$Package, [bool]`$PSBoundParameters['AllUsers']) }")
+"captured: $($cap.OS), $($packages.Count) packages, -AllUsers $((Get-Command Remove-AppxPackage).Parameters.ContainsKey('AllUsers'))"
 '''
-# Advanced functions, so an unknown parameter (-AllUsers on 2016) fails as the cmdlet does.
-REMOVE_2016 = "function Remove-AppxPackage { [CmdletBinding()] param([string]$Package) $script:removed += $Package }\n"
-REMOVE_2022 = ("function Remove-AppxPackage { [CmdletBinding()] param([string]$Package, [switch]$AllUsers)\n"
-               "    $script:removed += \"$Package allusers=$AllUsers\" }\n")
 
 
-def test_finalize_leaves_server_2016_system_apps_alone(tmp_path):
+def _appx(fixture: str) -> str:
+    return APPX_REPLAY.replace("__FIXTURE__", str(CAPTURED / fixture))
+
+
+def test_finalize_selects_no_server_2016_system_app(tmp_path):
     # Measured on the first ws2016 base build: Microsoft.AAD.BrokerPlugin was
     # taken for a stray package, and Remove-AppxPackage -AllUsers failed.
-    result = _finalize(tmp_path, APPX + REMOVE_2016 + r'''
-$pkgs = @(
-    (Pkg 'Microsoft.AAD.BrokerPlugin' 'System' $sys $false $null),
-    (Pkg 'Microsoft.Windows.ShellExperienceHost' 'Developer' "$env:windir\SystemApps\ShellExperienceHost_cw5n1h2txyewy" $false $null),
-    (Pkg 'Microsoft.VCLibs.140.00' 'Store' $store $true $null),
-    (Pkg 'Microsoft.Provisioned' 'Store' $store $false $null))
-$stray = Get-StrayAppxPackage -Packages $pkgs -ProvisionedNames @('Microsoft.Provisioned')
+    result, out = _finalize(tmp_path, _appx("appx-ws2016-14393.json") + r'''
+$broker = @($packages | Where-Object Name -eq 'Microsoft.AAD.BrokerPlugin')
+"broker: $($broker.Count) installed=$(@($broker.PackageUserInformation | Where-Object InstallState -eq 'Installed').Count) nonremovable-property=$([bool]$broker[0].PSObject.Properties['NonRemovable'])"
+$stray = Get-StrayAppxPackage -Packages $packages -ProvisionedNames $provisioned
 "stray: $(@($stray).Count)"
 Remove-StrayAppxPackage -Stray $stray
 "removed: $($script:removed.Count)"
 ''')
-    out = result.stdout + result.stderr
     assert result.returncode == 0, out
+    assert "captured: Microsoft Windows Server 2016 Standard Evaluation 10.0.14393" in out, out
+    assert "-AllUsers False" in out, out
+    # The package that broke run 1 is in the capture, installed for a user,
+    # with no NonRemovable property: the case the fix is for.
+    assert "broker: 1 installed=1 nonremovable-property=False" in out, out
     assert "stray: 0" in out and "0 package(s) removed" in out and "removed: 0" in out, out
 
 
-def test_finalize_refuses_a_server_2016_stray_package_by_name(tmp_path):
-    result = _finalize(tmp_path, APPX + REMOVE_2016 + r'''
-$pkgs = @((Pkg 'Microsoft.AAD.BrokerPlugin' 'System' $sys $false $null), (Pkg 'Example.App' 'Store' $store $false $null))
-$stray = Get-StrayAppxPackage -Packages $pkgs -ProvisionedNames @()
-"stray: $(($stray | ForEach-Object Name) -join ',')"
-try { Remove-StrayAppxPackage -Stray $stray; 'no error' } catch { "refused: $($_.Exception.Message)" }
+def test_finalize_refuses_removal_without_all_users_on_server_2016(tmp_path):
+    # Server 2016's Remove-AppxPackage has no -AllUsers: given a package to
+    # remove there, the step fails by name instead of calling it, and the
+    # binder refuses -AllUsers exactly as Windows did when it was tried.
+    fixture = json.loads((CAPTURED / "appx-ws2016-14393.json").read_text(encoding="utf-8-sig"))
+    real_error = fixture["RemoveAllUsersAttempt"]["Message"]
+    result, out = _finalize(tmp_path, _appx("appx-ws2016-14393.json") + r'''
+$broker = @($packages | Where-Object Name -eq 'Microsoft.AAD.BrokerPlugin')
+try { Remove-StrayAppxPackage -Stray $broker; 'no error' } catch { "refused: $($_.Exception.Message)" }
 "removed: $($script:removed.Count)"
+try { Remove-AppxPackage -Package $broker[0].PackageFullName -AllUsers; 'bound' } catch { "binder: $($_.Exception.Message)" }
 ''')
-    out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    assert "stray: Example.App\n" in out, out
-    assert "refused: Remove-AppxPackage has no -AllUsers here; remove by hand: Example.App_1.0_neutral__x" in out, out
+    broker = next(p for p in fixture["Packages"] if p["Name"] == "Microsoft.AAD.BrokerPlugin")
+    assert f"refused: Remove-AppxPackage has no -AllUsers here; remove by hand: {broker['PackageFullName']}" in out, out
     assert "removed: 0" in out, out
+    assert f"binder: {real_error}" in out, (real_error, out)
 
 
-def test_finalize_removes_stray_packages_for_all_users_on_server_2022(tmp_path):
-    # The Server 2019/2022 path the fix must not change: NonRemovable decides,
-    # and an unprovisioned user-installed package (Edge after an update) is
-    # removed with -AllUsers.
-    result = _finalize(tmp_path, APPX + REMOVE_2022 + r'''
-$pkgs = @(
-    (Pkg 'Microsoft.AAD.BrokerPlugin' 'System' $sys $false $true),
-    (Pkg 'Microsoft.MicrosoftEdge.Stable' 'Developer' 'C:\Program Files (x86)\Microsoft\Edge' $false $false),
-    (Pkg 'Microsoft.UI.Xaml.2.7' 'Store' $store $true $false),
-    (Pkg 'Microsoft.Provisioned' 'Store' $store $false $false))
-$stray = Get-StrayAppxPackage -Packages $pkgs -ProvisionedNames @('Microsoft.Provisioned')
-Remove-StrayAppxPackage -Stray $stray
+def test_finalize_on_the_captured_server_2022_inventory(tmp_path):
+    # The Server 2019/2022 path the fix must not change: NonRemovable decides
+    # (every package has it), nothing on a fresh clone is stray, and a package
+    # handed to the removal goes to Remove-AppxPackage -AllUsers.
+    result, out = _finalize(tmp_path, _appx("appx-ws2022-20348.json") + r'''
+"with NonRemovable: $(@($packages | Where-Object { $_.PSObject.Properties['NonRemovable'] }).Count)"
+$stray = Get-StrayAppxPackage -Packages $packages -ProvisionedNames $provisioned
+"stray: $(@($stray).Count)"
+$one = @($packages | Where-Object Name -eq 'Microsoft.AAD.BrokerPlugin')
+Remove-StrayAppxPackage -Stray $one
 $script:removed | ForEach-Object { "removed: $_" }
 ''')
-    out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    assert "removing Microsoft.MicrosoftEdge.Stable_1.0_neutral__x" in out, out
-    assert "1 package(s) removed" in out, out
-    assert out.count("removed: ") == 1 and "removed: Microsoft.MicrosoftEdge.Stable_1.0_neutral__x allusers=True" in out, out
+    assert "captured: Microsoft Windows Server 2022 Standard Evaluation 10.0.20348" in out, out
+    n = len(json.loads((CAPTURED / "appx-ws2022-20348.json").read_text(encoding="utf-8-sig"))["Packages"])
+    assert f"{n} packages, -AllUsers True" in out and f"with NonRemovable: {n}" in out, out
+    assert "stray: 0" in out, out
+    assert out.count("removed: ") == 1 and "allusers=True" in out, out
 
 
-# sshd as a stand-in service: Get-Service reads it, each read while pending
-# counts down $pendingReads until it is Running; Stop-Service fails while it is
-# pending, as the real one did ("Cannot stop sshd service").
-SSHD = r'''
+# sshd replayed from sshd-ws2016-14393.json: each Get-Service returns the next
+# captured status (the last one repeats); Stop-Service on a status that is
+# still pending throws the error the real one threw on the clone, and
+# otherwise moves on to the captured statuses after a stop; WaitForStatus reads
+# on until the status it wants, or throws the exception (type and message) the
+# real ServiceController threw. Set-Service is recorded, Start-Sleep is
+# skipped.
+SSHD_REPLAY = r'''
+Add-Type -AssemblyName System.ServiceProcess
+$cap = Get-Content -Raw -Encoding UTF8 -LiteralPath '__FIXTURE__' | ConvertFrom-Json
+function Expand($runs) { @(foreach ($r in @($runs)) { for ($i = 0; $i -lt [int]$r[1]; $i++) { "$($r[0])".Split(' ')[0] } }) }
+$script:queue = New-Object 'System.Collections.Generic.Queue[string]'
+foreach ($s in @(__START__)) { $script:queue.Enqueue($s) }
+$script:startType = 'Automatic'
 $script:log = @()
-$script:svc = @{ Status = '__STATUS__'; StartType = 'Automatic' }
-$script:pendingReads = __READS__
+function Next-Status { if ($script:queue.Count -gt 1) { $script:queue.Dequeue() } else { $script:queue.Peek() } }
 function Get-Service { param([string]$Name)
-    if ("$($script:svc.Status)" -like '*Pending') {
-        if ($script:pendingReads -le 0) { $script:svc.Status = 'Running' } else { $script:pendingReads-- } }
-    $o = [pscustomobject]@{ Name = $Name; Status = $script:svc.Status; StartType = $script:svc.StartType }
-    $o | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
-        param($want, $timeout) if ($script:svc.Status -ne $want) { throw "sshd is $($script:svc.Status), not $want" } }
+    $o = [pscustomobject]@{ Name = $Name; Status = (Next-Status); StartType = $script:startType }
+    $o | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value { param($want, $timeout)
+        while ($true) {
+            if ("$(Next-Status)" -eq "$want") { return }
+            if ($script:queue.Count -le 1 -and "$($script:queue.Peek())" -ne "$want") {
+                throw (New-Object System.ServiceProcess.TimeoutException $cap.Clone.WaitForStatusTimeout.Message) }
+        } }
     $o
 }
-function Set-Service { param([string]$Name, $StartupType) $script:svc.StartType = "$StartupType"; $script:log += "set $StartupType" }
+function Set-Service { param([string]$Name, $StartupType) $script:startType = "$StartupType"; $script:log += "set $StartupType" }
 function Stop-Service { param([string]$Name)
-    $script:log += "stop while $($script:svc.Status)"
-    if ("$($script:svc.Status)" -like '*Pending') { throw "Service 'OpenSSH SSH Server (sshd)' cannot be stopped" }
-    $script:svc.Status = 'Stopped' }
-function Start-Sleep { param($Seconds) [Threading.Thread]::Sleep(50) }
+    $now = "$($script:queue.Peek())"
+    $script:log += "stop while $now"
+    if ($now -like '*Pending') { throw $cap.Clone.StopRightAfterStart[-1].Result }
+    $script:queue.Clear()
+    foreach ($s in (Expand $cap.Clone.AfterStop)) { $script:queue.Enqueue($s) }
+}
+function Start-Sleep { param($Seconds) }
 try { Stop-SshdForSysprep __ARGS__; 'returned' } catch { "failed: $($_.Exception.Message)" }
-"final: $($script:svc.Status) $($script:svc.StartType)"
+"final: $($script:queue.Peek()) $($script:startType)"
 "log: $($script:log -join '; ')"
 '''
 
+SSHD_FIXTURE = CAPTURED / "sshd-ws2016-14393.json"
+START = {
+    # A fresh start on the clone: StartPending, then Running.
+    "starting": "Expand $cap.Clone.AfterStart",
+    # The build VM through the post-cleanup reboot until finalize: Running.
+    "build": "Expand @($cap.BuildVM.Runs | Where-Object { $_[0] -like 'Running*' })",
+    # After a stop on the clone: Stopped.
+    "stopped": "Expand $cap.Clone.AfterStop",
+    # Still starting, as Stop-Service left it on the clone, and never leaving it.
+    "pending": "$cap.Clone.StopRightAfterStart[-1].StatusAfter",
+}
 
-def _sshd(tmp_path, status, reads=0, args=""):
-    return _finalize(tmp_path, SSHD.replace("__STATUS__", status).replace("__READS__", str(reads))
-                     .replace("__ARGS__", args))
+
+def _sshd(tmp_path, start, args="", extra=""):
+    body = SSHD_REPLAY.replace("__FIXTURE__", str(SSHD_FIXTURE)).replace("__START__", START[start]) \
+        .replace("__ARGS__", args)
+    return _finalize(tmp_path, body + extra)
+
+
+def _captured_sshd():
+    return json.loads(SSHD_FIXTURE.read_text(encoding="utf-8-sig"))
+
+
+def test_captured_sshd_shows_the_failure_finalize_must_avoid():
+    clone = _captured_sshd()["Clone"]
+    assert clone["Binary"].endswith('Program Files\\OpenSSH\\sshd.exe"'), clone["Binary"]
+    assert clone["AfterStart"][0][0] == "StartPending" and clone["AfterStart"][-1][0] == "Running"
+    # The same error as base build run 2: a stop while sshd is still starting.
+    attempt = clone["StopRightAfterStart"][-1]
+    assert attempt["StatusBefore"] == "StartPending" and attempt["StatusAfter"] == "StartPending"
+    assert "cannot be stopped due to the following error: Cannot stop sshd service" in attempt["Result"]
+    assert clone["WaitForStatusTimeout"]["Type"] == "System.ServiceProcess.TimeoutException"
 
 
 def test_finalize_waits_out_a_starting_sshd_then_stops_it(tmp_path):
-    # Measured on the second ws2016 base build: Stop-Service sshd failed.
-    result = _sshd(tmp_path, "StartPending", reads=3)
-    out = result.stdout + result.stderr
+    result, out = _sshd(tmp_path, "starting")
     assert result.returncode == 0, out
     assert "sshd before the stop: StartPending, start type Disabled" in out, out
     assert "returned" in out and "final: Stopped Disabled" in out, out
     assert "log: set Disabled; stop while Running" in out, out
 
 
-def test_finalize_stops_a_running_sshd_and_leaves_a_stopped_one(tmp_path):
-    result = _sshd(tmp_path / "running", "Running")
-    out = result.stdout + result.stderr
-    assert result.returncode == 0 and "final: Stopped Disabled" in out, out
-    assert "log: set Disabled; stop while Running" in out, out
-    result = _sshd(tmp_path / "stopped", "Stopped")
-    out = result.stdout + result.stderr
-    assert result.returncode == 0 and "final: Stopped Disabled" in out, out
-    assert "log: set Disabled\n" in out, out
-
-
-def test_finalize_fails_when_sshd_stays_pending(tmp_path):
-    # Still starting after the wait: the stop is tried and its failure stops
-    # the step (fail closed; sysprep does not run).
-    result = _sshd(tmp_path, "StartPending", reads=10 ** 6, args="-PendingTimeoutSeconds 1")
-    out = result.stdout + result.stderr
+def test_finalize_stops_sshd_as_on_the_build_vm(tmp_path):
+    # The line finalize printed live on the rebuilt base's build VM.
+    result, out = _sshd(tmp_path, "build")
     assert result.returncode == 0, out
-    assert "failed: Service 'OpenSSH SSH Server (sshd)' cannot be stopped" in out, out
-    assert "final: StartPending Disabled" in out, out
+    assert "sshd before the stop: Running, start type Disabled" in out, out
+    assert "final: Stopped Disabled" in out and "log: set Disabled; stop while Running" in out, out
+
+
+def test_finalize_leaves_a_stopped_sshd_stopped(tmp_path):
+    result, out = _sshd(tmp_path, "stopped")
+    assert result.returncode == 0, out
+    assert "final: Stopped Disabled" in out and "log: set Disabled\n" in out, out
+
+
+def test_finalize_fails_when_sshd_stays_starting(tmp_path):
+    # Still starting after the wait: the stop is tried, fails as the real one
+    # did, and the step fails (sysprep does not run). WaitForStatus on it
+    # throws what the real ServiceController threw.
+    clone = _captured_sshd()["Clone"]
+    result, out = _sshd(tmp_path, "pending", args="-PendingTimeoutSeconds 1", extra=r'''
+try { (Get-Service sshd).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(2)); 'no timeout' }
+catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }; "wait: $($e.GetType().FullName): $($e.Message)" }
+''')
+    assert result.returncode == 0, out
+    assert f"failed: {clone['StopRightAfterStart'][-1]['Result']}" in out, out
+    assert "final: StartPending Disabled" in out and "log: set Disabled; stop while StartPending" in out, out
+    timeout = clone["WaitForStatusTimeout"]
+    assert f"wait: {timeout['Type']}: {timeout['Message']}" in out, out

@@ -1,0 +1,55 @@
+{
+ "Description": "sshd (Win32-OpenSSH 10.0p2 MSI) on Windows Server 2016 14393, as SYSTEM through the QEMU guest agent. BuildVM: read-only Get-Service samples (about 1 s apart, through the agent) on the base build VM from its post-cleanup reboot until finalize.ps1 had stopped sshd. Clone: a fresh clone of that base; AfterStart/AfterStop are Get-Service samples 20 ms apart after sc.exe start/stop sshd ([status, consecutive samples]); StopRightAfterStart is Stop-Service issued right after sc.exe start; WaitForStatusTimeout is ServiceController.WaitForStatus(Stopped, 2 s) on a running sshd.",
+ "BuildVM": {
+  "Captured": "2026-11-21",
+  "Note": "sshd on build VM 8009, from the post-cleanup reboot (03:51:37) until finalize ends; Get-Service through the agent, about 1 s apart",
+  "Runs": [
+   [
+    "agent-unavailable",
+    6
+   ],
+   [
+    "Running Automatic",
+    90
+   ],
+   [
+    "Stopped Disabled",
+    8
+   ]
+  ]
+ },
+ "Clone": {
+  "Captured": "2026-11-21T03:58:53Z",
+  "OS": "Microsoft Windows Server 2016 Standard Evaluation 10.0.14393.0",
+  "Binary": "\"C:\\Program Files\\OpenSSH\\sshd.exe\"",
+  "Initial": "Running Automatic",
+  "AfterStart": [
+   [
+    "StartPending",
+    1
+   ],
+   [
+    "Running",
+    96
+   ]
+  ],
+  "AfterStop": [
+   [
+    "Stopped",
+    97
+   ]
+  ],
+  "StopRightAfterStart": [
+   {
+    "StatusBefore": "StartPending",
+    "Result": "Service 'OpenSSH SSH Server (sshd)' cannot be stopped due to the following error: Cannot stop sshd service on computer '.'.",
+    "StatusAfter": "StartPending"
+   }
+  ],
+  "WaitForStatusTimeout": {
+   "Type": "System.ServiceProcess.TimeoutException",
+   "Message": "Time out has expired and the operation has not been completed."
+  },
+  "Final": "Running"
+ }
+}

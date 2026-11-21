@@ -9,9 +9,17 @@
 # Usage: scripts/image_build/proxmox_base_ubuntu.sh [--apply] [options]
 #   --release R       2004, 2204 or 2404 (default 2404): Ubuntu 20.04, 22.04
 #                     or 24.04
-#   --image PATH      cloud image on PVE_NODE (default
-#                     /var/lib/vz/template/iso/<codename>-server-cloudimg-amd64.img,
-#                     codename focal, jammy or noble from --release)
+#   (default image)   the release's pinned cloud image: a dated release URL
+#                     and its SHA-256 (PIN_URL/PIN_SHA256 below), kept on
+#                     PVE_NODE as /var/lib/vz/template/iso/<codename>-server-
+#                     cloudimg-amd64-<serial>.img; --apply fetches it there
+#                     when it is absent
+#   --image-url URL   another dated image instead, .../release-<serial>/
+#                     ubuntu-<version>-server-cloudimg-amd64.img over https;
+#                     needs --sha256. A moving name (current, latest) is refused
+#   --sha256 HEX      the image's SHA-256 (default: the release's pin)
+#   --image PATH      a file on PVE_NODE to use instead; it must hash to
+#                     --sha256 or the pin, and is fetched only with --image-url
 #   --snippets STORE  storage with the `snippets` content type, for the
 #                     first-boot user-data (default local)
 #   --vmid N          VMID in 8000-8499 (default: the lowest V with V and
@@ -19,6 +27,10 @@
 #   --date YYYYMMDD   date in the name (default today, UTC)
 #   --disk SIZE       root disk, e.g. 20G (default 20G); the Proxmox backend
 #                     does not resize, so this is every image's disk size
+#
+# The image is checked before anything is created: a file on the node, or a
+# download, whose SHA-256 is not the pinned one stops the run (fail closed),
+# so a rebuild cannot silently start from different bytes.
 #
 # Dry run by default: reads the cluster and prints every command that would
 # change it. --apply runs them. It never touches an existing guest: a VMID in
@@ -59,6 +71,9 @@ CONFIG="${IMAGE_BUILD_CONFIG:-$SCRIPT_DIR/config.env}"
 APPLY=0
 RELEASE=2404
 IMAGE=""
+IMAGE_URL=""
+IMAGE_SHA256=""
+SHA_GIVEN=0
 SNIPPETS=local
 VMID=""
 DATE="$(date -u +%Y%m%d)"
@@ -73,11 +88,13 @@ while [ $# -gt 0 ]; do
         --dry-run) APPLY=0 ;;
         --release) RELEASE="${2?--release needs 2004, 2204 or 2404}"; shift ;;
         --image) IMAGE="${2:?--image needs a path}"; shift ;;
+        --image-url) IMAGE_URL="${2:?--image-url needs a URL}"; shift ;;
+        --sha256) IMAGE_SHA256="${2?--sha256 needs a SHA-256}"; SHA_GIVEN=1; shift ;;
         --snippets) SNIPPETS="${2:?--snippets needs a storage}"; shift ;;
         --vmid) VMID="${2:?--vmid needs a VMID}"; shift ;;
         --date) DATE="${2:?--date needs YYYYMMDD}"; shift ;;
         --disk) DISK="${2:?--disk needs a size}"; shift ;;
-        -h|--help) sed -n '3,52p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '3,64p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'ERROR: unknown option %s\n' "$1" >&2; exit 2 ;;
     esac
     shift
@@ -92,7 +109,33 @@ case "$RELEASE" in
     2404) VERSION=24.04; CODENAME=noble; SSH_UNIT=ssh.socket ;;
     *) die "--release must be one of 2004 2204 2404 (got '$RELEASE')" ;;
 esac
-IMAGE="${IMAGE:-/var/lib/vz/template/iso/$CODENAME-server-cloudimg-amd64.img}"
+
+# The pinned cloud image of each release: a dated release directory (never
+# current/, whose file changes under the same name) and the SHA-256 Ubuntu
+# publishes for it in that directory's SHA256SUMS.
+case "$RELEASE" in
+    # 20.04's last image (standard support ended 2025-05); base-ubuntu-2004-20261121.
+    2004) PIN_URL=https://cloud-images.ubuntu.com/releases/focal/release-20250624/ubuntu-20.04-server-cloudimg-amd64.img
+          PIN_SHA256=18f2977d77dfea1b74aee14533bd21c34f789139e949c57023b7364894b7e5e9 ;;
+    2204) PIN_URL=https://cloud-images.ubuntu.com/releases/jammy/release-20261109/ubuntu-22.04-server-cloudimg-amd64.img
+          PIN_SHA256=77d19e53656f87c95f1f6c6be59c789083b3f77fa08f9d88011ee04085c61f87 ;;
+    # The image base-ubuntu-2404-20261113 was built from.
+    2404) PIN_URL=https://cloud-images.ubuntu.com/releases/noble/release-20260911/ubuntu-24.04-server-cloudimg-amd64.img
+          PIN_SHA256=612b2c0cc1bc413a6cb8c38fd611794caf0f2b436c50013d8b3794db12ad7354 ;;
+esac
+if [ -n "$IMAGE_URL" ]; then
+    [ "$SHA_GIVEN" -eq 1 ] || die "--image-url needs --sha256 (the image's SHA-256 from that release's SHA256SUMS)"
+elif [ -z "$IMAGE" ]; then
+    IMAGE_URL="$PIN_URL"
+fi
+[ "$SHA_GIVEN" -eq 1 ] || IMAGE_SHA256="$PIN_SHA256"
+IMAGE_URL_RE="^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+)*/(release-)?20[0-9]{6}(\.[0-9]+)?/ubuntu-${VERSION/./\\.}-server-cloudimg-amd64\.img$"
+IMAGE_URL_FORM="Ubuntu $VERSION release image (.../release-<serial>/ubuntu-$VERSION-server-cloudimg-amd64.img)"
+# The node-side name carries the serial, so two pins never share a file.
+image_file() {
+    [[ "$1" =~ /(release-)?(20[0-9]{6}(\.[0-9]+)?)/[^/]+$ ]]
+    printf '%s-server-cloudimg-amd64-%s.img\n' "$CODENAME" "${BASH_REMATCH[2]}"
+}
 
 NAME="base-ubuntu-$RELEASE-$DATE"
 

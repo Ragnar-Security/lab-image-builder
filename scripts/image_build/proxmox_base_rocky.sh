@@ -7,8 +7,17 @@
 # guarantees as proxmox_base_ubuntu.sh (proxmox_base_lib.sh).
 #
 # Usage: scripts/image_build/proxmox_base_rocky.sh [--apply] [options]
-#   --image PATH      cloud image on PVE_NODE (default
-#                     /var/lib/vz/template/iso/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2)
+#   (default image)   the pinned Rocky 9 GenericCloud image: a dated URL and
+#                     its SHA-256 (PIN_URL/PIN_SHA256 below), kept on
+#                     PVE_NODE under its own dated file name in
+#                     /var/lib/vz/template/iso; --apply fetches it there when
+#                     it is absent
+#   --image-url URL   another dated image instead, .../Rocky-9-GenericCloud-
+#                     Base-9.<minor>-<yyyymmdd>.<n>.x86_64.qcow2 over https;
+#                     needs --sha256. A moving name (latest) is refused
+#   --sha256 HEX      the image's SHA-256 (default: the pin)
+#   --image PATH      a file on PVE_NODE to use instead; it must hash to
+#                     --sha256 or the pin, and is fetched only with --image-url
 #   --snippets STORE  storage with the `snippets` content type, for the
 #                     first-boot user-data (default local)
 #   --vmid N          VMID in 8000-8499 (default: the lowest V with V and
@@ -16,6 +25,10 @@
 #   --date YYYYMMDD   date in the name (default today, UTC)
 #   --disk SIZE       root disk, e.g. 20G (default 20G); the Proxmox backend
 #                     does not resize, so this is every image's disk size
+#
+# The image is checked before anything is created: a file on the node, or a
+# download, whose SHA-256 is not the pinned one stops the run (fail closed),
+# so a rebuild cannot silently start from different bytes.
 #
 # Dry run by default: reads the cluster and prints every command that would
 # change it. --apply runs them. It never touches an existing guest: a VMID in
@@ -62,7 +75,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${IMAGE_BUILD_CONFIG:-$SCRIPT_DIR/config.env}"
 
 APPLY=0
-IMAGE=/var/lib/vz/template/iso/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+IMAGE=""
+IMAGE_URL=""
+IMAGE_SHA256=""
+SHA_GIVEN=0
 SNIPPETS=local
 VMID=""
 DATE="$(date -u +%Y%m%d)"
@@ -76,17 +92,37 @@ while [ $# -gt 0 ]; do
         --apply) APPLY=1 ;;
         --dry-run) APPLY=0 ;;
         --image) IMAGE="${2:?--image needs a path}"; shift ;;
+        --image-url) IMAGE_URL="${2:?--image-url needs a URL}"; shift ;;
+        --sha256) IMAGE_SHA256="${2?--sha256 needs a SHA-256}"; SHA_GIVEN=1; shift ;;
         --snippets) SNIPPETS="${2:?--snippets needs a storage}"; shift ;;
         --vmid) VMID="${2:?--vmid needs a VMID}"; shift ;;
         --date) DATE="${2:?--date needs YYYYMMDD}"; shift ;;
         --disk) DISK="${2:?--disk needs a size}"; shift ;;
-        -h|--help) sed -n '3,57p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '3,70p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'ERROR: unknown option %s\n' "$1" >&2; exit 2 ;;
     esac
     shift
 done
 
 NAME="base-rocky-9-$DATE"
+
+# The pinned image: a dated file in Rocky's 9.9 directory (never the
+# `latest` name, whose bytes change with each refresh) and the SHA-256 from
+# its .CHECKSUM there; base-rocky-9-20261121 was built from it. When 9.10
+# ships, Rocky moves the 9.9 directory to https://dl.rockylinux.org/vault/
+# rocky/9.9/; the hash stays the pin.
+PIN_URL=https://dl.rockylinux.org/pub/rocky/9.9/images/x86_64/Rocky-9-GenericCloud-Base-9.9-20261112.0.x86_64.qcow2
+PIN_SHA256=4f88f4209de50813d8054ab97309e7169a580206a0c4ea04f375d36c4846d50e
+if [ -n "$IMAGE_URL" ]; then
+    [ "$SHA_GIVEN" -eq 1 ] || die "--image-url needs --sha256 (the image's SHA-256 from its .CHECKSUM)"
+elif [ -z "$IMAGE" ]; then
+    IMAGE_URL="$PIN_URL"
+fi
+[ "$SHA_GIVEN" -eq 1 ] || IMAGE_SHA256="$PIN_SHA256"
+IMAGE_URL_RE='^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+)*/Rocky-9-GenericCloud-Base-9\.[0-9]+-20[0-9]{6}\.[0-9]+\.x86_64\.qcow2$'
+IMAGE_URL_FORM="Rocky 9 GenericCloud image (.../Rocky-9-GenericCloud-Base-9.<minor>-<yyyymmdd>.<n>.x86_64.qcow2)"
+# Rocky's file names are dated already.
+image_file() { basename "$1"; }
 
 # --- first-boot user-data: no key, no password -----------------------------
 # write_files and runcmd run as root under cloud-init, before this script's

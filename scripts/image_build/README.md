@@ -542,19 +542,40 @@ SSH as the builder does. It uses five keys: `PVE_HOST`, `PVE_NODE`,
 `PVE_STORAGE` (the template's disk), `PVE_BUILD_BRIDGE` and `PVE_BUILD_VLAN`.
 
 ```
-scripts/image_build/proxmox_base_ubuntu.sh [--release R] [--image PATH] [--snippets STORE]   # dry run
-scripts/image_build/proxmox_base_ubuntu.sh --apply [--release R] [--image PATH] [--snippets STORE]
+scripts/image_build/proxmox_base_ubuntu.sh [--release R] [--snippets STORE]   # dry run
+scripts/image_build/proxmox_base_ubuntu.sh --apply [--release R] [--snippets STORE]
 ```
 
 **It is a dry run by default.** Without `--apply` it runs only the read-only
 checks and prints every command that would change the cluster, the user-data
 and the in-guest finalize script. Options: `--release` (`2004`, `2204` or
-`2404`, default `2404`), `--image` (the cloud image on `PVE_NODE`, default
-`/var/lib/vz/template/iso/<codename>-server-cloudimg-amd64.img` with codename
-`focal`, `jammy` or `noble`), `--snippets` (a
+`2404`, default `2404`), `--image-url` and `--sha256` (another pinned image,
+below), `--image` (a file already on `PVE_NODE` to use instead; it must hash
+to `--sha256` or the release's pin), `--snippets` (a
 storage with the `snippets` content type, default `local`), `--vmid`,
 `--date` (default today, UTC) and `--disk` (default `20G`; the backend does
 not resize, so this is every image's disk size).
+
+**The cloud image is pinned.** Each release has one pinned image: a URL in a
+dated release directory (never `current/`, whose file changes under the same
+name) and the SHA-256 Ubuntu publishes for it in that directory's
+`SHA256SUMS`:
+
+| `--release` | Pinned image | SHA-256 |
+|---|---|---|
+| `2004` | `https://cloud-images.ubuntu.com/releases/focal/release-20250624/ubuntu-20.04-server-cloudimg-amd64.img` (20.04's last) | `18f2977d77dfea1b74aee14533bd21c34f789139e949c57023b7364894b7e5e9` |
+| `2204` | `https://cloud-images.ubuntu.com/releases/jammy/release-20261109/ubuntu-22.04-server-cloudimg-amd64.img` | `77d19e53656f87c95f1f6c6be59c789083b3f77fa08f9d88011ee04085c61f87` |
+| `2404` | `https://cloud-images.ubuntu.com/releases/noble/release-20260911/ubuntu-24.04-server-cloudimg-amd64.img` (what `base-ubuntu-2404-20261113` was built from) | `612b2c0cc1bc413a6cb8c38fd611794caf0f2b436c50013d8b3794db12ad7354` |
+
+On the node the image lives at
+`/var/lib/vz/template/iso/<codename>-server-cloudimg-amd64-<serial>.img`;
+with `--apply` the script fetches it there when it is absent (to a `.part`
+file, moved into place only once its SHA-256 is the pinned one). **The check
+fails closed:** a file on the node or a download whose SHA-256 is not the
+pinned one stops the run before anything is created, so a rebuild cannot
+silently start from different bytes. The packages the first boot installs
+still come from the release's live archive (and are upgraded there), so a
+rebuild pins the image, not every package.
 
 **VMID.** The lowest `V` in `8000`-`8499` with both `V` and `V+500` free
 anywhere in the cluster, so the replica can sit at `V+500`. `--vmid` is
@@ -598,24 +619,26 @@ a VM the run could not destroy (a lost connection, say) can be identified
 and removed by hand. The snippet is deleted on every exit; if the node cannot
 confirm it is gone, the run exits non-zero with an error naming its path.
 
-**Rebuilding for a new point release.** Ubuntu refreshes each release's
-cloud image for each point release and between them for security updates.
-On `PVE_NODE`, replace the image at the `--image` path with the current one
-and check it against Ubuntu's published `SHA256SUMS` (the
-`<codename>/current/` directory keeps the file name the script expects;
-`noble` shown):
+**Rebuilding for a new point release.** Ubuntu publishes a new dated image
+for each point release and between them for security updates. To move a
+release to one, pick its `release-<serial>/` directory under
+`https://cloud-images.ubuntu.com/releases/<codename>/`, take the image's
+line from that directory's `SHA256SUMS`, and pass both:
 
 ```
-cd /var/lib/vz/template/iso
-wget -O noble-server-cloudimg-amd64.img \
-  https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
-wget -O SHA256SUMS https://cloud-images.ubuntu.com/noble/current/SHA256SUMS
-grep ' \*noble-server-cloudimg-amd64.img$' SHA256SUMS | sha256sum -c -
+scripts/image_build/proxmox_base_ubuntu.sh --release 2404 \
+  --image-url https://cloud-images.ubuntu.com/releases/noble/release-<serial>/ubuntu-24.04-server-cloudimg-amd64.img \
+  --sha256 <its SHA-256 from SHA256SUMS>
 ```
 
-20.04's standard support ended in May 2025; `focal/current/` still serves its
-last image (built 2025-06-24), and the 20.04 archive still installs packages,
-but neither gets updates now.
+A URL without a dated serial directory, or naming `current` or `latest`, is
+refused, as is `--image-url` without `--sha256`. When the new image should
+be the default, change the release's `PIN_URL` and `PIN_SHA256` in the script
+(and the table above) in the same commit.
+
+20.04's standard support ended in May 2025; `release-20250624` is its last
+image, and the 20.04 archive still installs packages, but neither gets
+updates now.
 
 Then run the script, dry run first, then with `--apply`. The new base gets
 today's date in its name and the next free VMID pair. Prove it before any
@@ -634,18 +657,21 @@ nothing needs it, as in "Deleting an old image".
 a RHEL-family base meeting the same contract, from the official Rocky Linux 9
 GenericCloud image. It runs on the same engine as `proxmox_base_ubuntu.sh`
 (`proxmox_base_lib.sh`): the same options except `--release`, the same keys,
-dry run, VMID rule, memory floor and marker-checked cleanup. The default
-`--image` is
-`/var/lib/vz/template/iso/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2`;
-pass the dated file instead, so the template's description names the build:
+dry run, VMID rule, memory floor and marker-checked cleanup. Its image is
+pinned the same way, fails closed the same way, and is fetched the same way
+when absent:
 
-```
-cd /var/lib/vz/template/iso
-R=Rocky-9-GenericCloud-Base-9.9-20261112.0.x86_64.qcow2   # the current one
-wget -O $R https://dl.rockylinux.org/pub/rocky/9/images/x86_64/$R
-wget -O $R.CHECKSUM https://dl.rockylinux.org/pub/rocky/9/images/x86_64/$R.CHECKSUM
-grep SHA256 $R.CHECKSUM; sha256sum $R      # the two must match
-```
+| Pinned image | SHA-256 |
+|---|---|
+| `https://dl.rockylinux.org/pub/rocky/9.9/images/x86_64/Rocky-9-GenericCloud-Base-9.9-20261112.0.x86_64.qcow2` (what `base-rocky-9-20261121` was built from) | `4f88f4209de50813d8054ab97309e7169a580206a0c4ea04f375d36c4846d50e` (Rocky's `.CHECKSUM` for it) |
+
+It is kept on the node under its own dated name in
+`/var/lib/vz/template/iso`. The moving `Rocky-9-GenericCloud-Base.latest`
+name is refused as an `--image-url`; another image is
+`--image-url .../Rocky-9-GenericCloud-Base-9.<minor>-<yyyymmdd>.<n>.x86_64.qcow2 --sha256 <hash from its .CHECKSUM>`.
+When Rocky 9.10 ships, Rocky moves the `9.9/` directory to
+`https://dl.rockylinux.org/vault/rocky/9.9/`: pass the vault URL with the
+same hash.
 
 What differs from the Ubuntu base:
 

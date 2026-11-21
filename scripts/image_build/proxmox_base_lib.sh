@@ -3,7 +3,17 @@
 # The engine shared by the Proxmox Linux base scripts (proxmox_base_ubuntu.sh,
 # proxmox_base_rocky.sh). Sourced, never run: the caller parses its options
 # and then sets, before sourcing this file,
-#   APPLY IMAGE SNIPPETS VMID DATE DISK CONFIG   from its options;
+#   APPLY IMAGE SNIPPETS VMID DATE DISK CONFIG   from its options (IMAGE
+#               may be empty: it then derives from IMAGE_URL);
+#   IMAGE_URL   the dated https URL the cloud image is fetched from when it
+#               is not on the node yet; empty: the image must be there;
+#   IMAGE_SHA256  the image's pinned SHA-256: a file on the node, or a
+#               download, that hashes to anything else stops the run before
+#               anything is created;
+#   IMAGE_URL_RE, IMAGE_URL_FORM  the regex a dated image URL of this
+#               distribution matches, and its description for errors;
+#   image_file  prints the node-side file name for a URL (dated, so two
+#               pins never share a path);
 #   NAME        the template name, base-<distro>-<...>-<DATE>;
 #   BASE_LABEL  the cloud image's distribution and release, for the
 #               template description ("Ubuntu 24.04", "Rocky Linux 9");
@@ -18,7 +28,8 @@
 # image, boots it with the user-data, runs the finalize, removes the
 # cloud-init drive and makes the VM a template. Every guarantee in the
 # callers' headers (VMID block, marker-checked cleanup, snippet removal) is
-# kept here.
+# kept here. The cloud image is pinned by URL and SHA-256 and checked before
+# anything is created: a mismatch fails closed.
 
 BUILD_MEMORY=2048
 BUILD_CORES=2
@@ -27,6 +38,7 @@ BLOCK_MIN=8000
 BLOCK_MAX=8499
 REPLICA_OFFSET=500
 SCRIPT_NAME="scripts/image_build/$(basename "$0")"
+ISO_DIR=/var/lib/vz/template/iso
 
 # --- config: only the PVE_ keys come back, as in build_image.sh ------------
 [ -f "$CONFIG" ] || die "config $CONFIG does not exist"
@@ -48,6 +60,16 @@ done
 [[ "$PVE_BUILD_VLAN" =~ ^[1-9][0-9]{0,3}$ && "$PVE_BUILD_VLAN" -le 4094 ]] \
     || die "PVE_BUILD_VLAN must be 1-4094 (got '$PVE_BUILD_VLAN')"
 
+# --- the cloud image: pinned bytes, and only a dated URL to fetch them -----
+[[ "$IMAGE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--sha256 must be 64 lowercase hex digits (got '$IMAGE_SHA256')"
+if [ -n "$IMAGE_URL" ]; then
+    case "${IMAGE_URL,,}" in
+        *latest*|*/current/*) die "--image-url $IMAGE_URL names a moving image; pin a dated $IMAGE_URL_FORM" ;;
+    esac
+    [[ "$IMAGE_URL" =~ $IMAGE_URL_RE && "$IMAGE_URL" != *..* ]] \
+        || die "--image-url must be a dated $IMAGE_URL_FORM over https (got '$IMAGE_URL')"
+    IMAGE="${IMAGE:-$ISO_DIR/$(image_file "$IMAGE_URL")}"
+fi
 [[ "$IMAGE" =~ ^/[A-Za-z0-9._/-]+$ && "$IMAGE" != *..* ]] || die "--image must be an absolute path (got '$IMAGE')"
 [[ "$SNIPPETS" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "--snippets must be a storage name (got '$SNIPPETS')"
 [[ "$DATE" =~ ^20[0-9]{6}$ ]] || die "--date must be YYYYMMDD (got '$DATE')"
@@ -123,8 +145,19 @@ avail_kib="$(pve sh -c "sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' /proc/memi
 [ "$avail_kib" -ge "$MIN_AVAILABLE_KIB" ] \
     || die "$PVE_NODE has $((avail_kib / 1024 / 1024)) GiB available; 16 GiB is the floor"
 
-pve test -f "$IMAGE" || die "cloud image $IMAGE not found on $PVE_NODE"
-image_sha="$(pve sha256sum "$IMAGE" | cut -d' ' -f1)"
+# A file already on the node is used only if it is the pinned bytes; an
+# absent one is fetched (with --apply, below) only from a dated URL.
+IMAGE_FETCH=0
+if pve test -f "$IMAGE"; then
+    image_sha="$(pve sha256sum "$IMAGE" | cut -d' ' -f1)"
+    [ "$image_sha" = "$IMAGE_SHA256" ] \
+        || die "cloud image $IMAGE on $PVE_NODE has sha256 $image_sha, not the pinned $IMAGE_SHA256; refusing"
+elif [ -n "$IMAGE_URL" ]; then
+    IMAGE_FETCH=1
+    image_sha="$IMAGE_SHA256"
+else
+    die "cloud image $IMAGE not found on $PVE_NODE"
+fi
 snippet_path="$(pve pvesm path "$SNIPPETS:snippets/$SNIPPET_FILE")" \
     || die "storage $SNIPPETS has no snippets content type"
 pve test -d "$(dirname "$snippet_path")" || die "snippet directory $(dirname "$snippet_path") does not exist on $PVE_NODE"
@@ -141,7 +174,11 @@ for x in sorted(json.load(sys.stdin), key=lambda x: x["vmid"]):
 
 if [ "$APPLY" -eq 1 ]; then say "== base template: APPLY =="; else say "== base template: dry run (nothing will change) =="; fi
 say "VM $VMID '$NAME' on $PVE_NODE: disk $DISK on $PVE_STORAGE, net0 $PVE_BUILD_BRIDGE VLAN $PVE_BUILD_VLAN (DHCP)"
-say "  image:     $IMAGE (sha256 $image_sha)"
+if [ "$IMAGE_FETCH" -eq 1 ]; then
+    say "  image:     $IMAGE (not on $PVE_NODE: fetched from $IMAGE_URL, must hash to sha256 $IMAGE_SHA256)"
+else
+    say "  image:     $IMAGE (sha256 $image_sha, the pinned hash)"
+fi
 say "  user-data: $SNIPPETS:snippets/$SNIPPET_FILE (deleted afterwards)"
 say "  $PVE_NODE MemAvailable: $((avail_kib / 1024 / 1024)) GiB"
 say "  guests in 8000-8999 now:${in_block:+$'\n'$in_block}${in_block:- none}"
@@ -159,6 +196,24 @@ if r.get("exited") not in (1, True):
     sys.exit("guest command did not finish within the timeout")
 sys.exit(0 if r.get("exitcode") == 0 else "guest command exited %s" % r.get("exitcode"))
 '
+}
+
+# The node-side fetch of the cloud image: download beside the target, check
+# the pinned SHA-256, and only then move it into place; a failed or wrong
+# download leaves nothing behind. $1 path, $2 URL, $3 SHA-256.
+fetch_script() {
+    cat <<'EOF'
+set -eu
+part="$1.part"
+trap 'rm -f "$part"' EXIT
+curl -fsSL --retry 3 -o "$part" "$2"
+got="$(sha256sum "$part" | cut -d' ' -f1)"
+if [ "$got" != "$3" ]; then
+    echo "downloaded $2 has sha256 $got, not the pinned $3" >&2
+    exit 3
+fi
+mv "$part" "$1"
+EOF
 }
 
 # --- cleanup ---------------------------------------------------------------
@@ -275,6 +330,10 @@ trap 'exit 143' TERM
 
 # --- apply -----------------------------------------------------------------
 say "  marker:    $RUN_TAG (in the description until the VM is a template)"
+if [ "$IMAGE_FETCH" -eq 1 ]; then
+    run sh -c "$(fetch_script)" fetch "$IMAGE" "$IMAGE_URL" "$IMAGE_SHA256" \
+        || die "fetching $IMAGE_URL to $IMAGE on $PVE_NODE failed (see above); nothing was created"
+fi
 if [ "$APPLY" -eq 1 ]; then
     # The path was checked absent above: what is there from now on is ours.
     SNIPPET_ARMED=1

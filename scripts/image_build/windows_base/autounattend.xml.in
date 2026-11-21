@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Unattended install of the Proxmox Windows base (proxmox_base_windows.sh).
-  Windows Server 2022 Standard Evaluation (Desktop Experience) on the virtio-scsi
+  Windows Server @@YEAR@@ Standard Evaluation (Desktop Experience) on the virtio-scsi
   disk scsi0, one MBR partition (SeaBIOS). The password placeholder is replaced by a
   random value per run; this file lives only on the run's own ISO, which the
   script deletes, and sysprep replaces the password with another random one.
@@ -23,18 +23,18 @@
     <component name="Microsoft-Windows-PnpCustomizationsWinPE" processorArchitecture="amd64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <DriverPaths>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="1"><Path>D:\vioscsi\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="2"><Path>E:\vioscsi\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="3"><Path>F:\vioscsi\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="4"><Path>G:\vioscsi\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="5"><Path>H:\vioscsi\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="6"><Path>I:\vioscsi\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="7"><Path>D:\NetKVM\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="8"><Path>E:\NetKVM\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="9"><Path>F:\NetKVM\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="10"><Path>G:\NetKVM\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="11"><Path>H:\NetKVM\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="12"><Path>I:\NetKVM\2k22\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="1"><Path>D:\vioscsi\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="2"><Path>E:\vioscsi\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="3"><Path>F:\vioscsi\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="4"><Path>G:\vioscsi\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="5"><Path>H:\vioscsi\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="6"><Path>I:\vioscsi\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="7"><Path>D:\NetKVM\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="8"><Path>E:\NetKVM\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="9"><Path>F:\NetKVM\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="10"><Path>G:\NetKVM\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="11"><Path>H:\NetKVM\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="12"><Path>I:\NetKVM\@@VIRTIO_DIR@@\amd64</Path></PathAndCredentials>
       </DriverPaths>
     </component>
 
@@ -63,7 +63,7 @@
           <InstallFrom>
             <MetaData wcm:action="add">
               <Key>/IMAGE/NAME</Key>
-              <Value>Windows Server 2022 SERVERSTANDARD</Value>
+              <Value>Windows Server @@YEAR@@ SERVERSTANDARD</Value>
             </MetaData>
           </InstallFrom>
           <InstallTo><DiskID>0</DiskID><PartitionID>1</PartitionID></InstallTo>

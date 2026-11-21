@@ -85,6 +85,18 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Two optional parts of the backend contract: `BACKEND_RECIPE_KEYS` (recipe
   keys a backend requires) and `backend_reboot` (a backend's own reboot for
   a setup that exits 100).
+- `proxmox_base_windows.sh --os ws2022|ws2019|ws2016` (default `ws2022`,
+  unchanged) builds `base-<os>-<yyyymmdd>` from that release's evaluation
+  ISO: the image name, the virtio-win driver directory, the default `--iso`
+  and the Proxmox `ostype` follow the release. Server 2016 has no OpenSSH
+  capability, so its base installs one pinned Win32-OpenSSH MSI
+  (`windows_base/install-openssh.ps1`), only if its SHA-256 matches the pin;
+  and where .NET offers no TLS 1.2 by default the base turns it on.
+- `expand_payload.ps1`: on a Windows build VM without `tar.exe` (Server 2016
+  and older) the core extracts the payload with .NET instead. It checks the
+  whole gzip stream against its trailer (CRC-32 and length) before writing
+  anything, and refuses links, paths outside the payload directory and
+  damaged tar headers.
 
 ### Changed
 
@@ -93,6 +105,24 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   started before the change.
 
 ### Fixed
+
+- Every clone of a Windows image gets its own SSH host keys. Before, a
+  Windows image kept its build VM's keys: every clone of a `KEEP_SSH=yes`
+  image presented the same host key, and every clone of any Windows image
+  carried the same private host keys on disk. `seal_windows.ps1` now deletes
+  `C:\ProgramData\ssh\ssh_host_*` in both modes and fails if one survives.
+  With `-KeepSsh` it also leaves sshd `Manual` and registers a SYSTEM
+  startup task: on Server 2016 the service manager restarts sshd during the
+  save's shutdown, which writes new keys into the image after the seal. On a
+  clone's first boot the task makes the clone's own keys with `ssh-keygen -A`,
+  checks they exist and differ from the image's, and only then sets sshd
+  `Automatic` and starts it; on failure sshd stays `Manual` and stopped and
+  the task retries at the next boot (5 attempts). Once sshd runs on the new
+  keys, the cleanup (unregister the task, delete the script, log) is best
+  effort and never stops sshd. The task's script and
+  directory, the task and its file are administrators-only, and the seal
+  reads that back and fails otherwise. `seal_linux.sh` already deleted the
+  keys in both modes.
 
 - A build stopped by SIGTERM no longer leaves its build VM running when the
   signal also killed the reader of the builder's stderr (a `tee` into a log)

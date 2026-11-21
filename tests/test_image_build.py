@@ -40,12 +40,16 @@ def _tool(bin_dir: Path, name: str, body: str) -> None:
     path.chmod(0o755)
 
 
-def _seal_env(tmp_path: Path) -> dict:
+def _seal_env(tmp_path: Path, family: str = "debian") -> dict:
     """A temp root laid out like a freshly built VM, plus logging fakes for the
-    commands that act on the live system."""
+    commands that act on the live system. `family` picks the OpenSSH unit the
+    distribution ships: ssh.service (Debian/Ubuntu) or sshd.service (RHEL)."""
     root = tmp_path / "root"
-    for rel in ("tmp/image-build/sub", "home/builder/.ssh", "home/other", "root", "etc/ssh"):
+    for rel in ("tmp/image-build/sub", "home/builder/.ssh", "home/other", "root", "etc/ssh",
+                "usr/lib/systemd/system"):
         (root / rel).mkdir(parents=True)
+    unit = {"debian": "ssh.service", "rhel": "sshd.service"}[family]
+    (root / "usr/lib/systemd/system" / unit).write_text("[Service]\n")
     (root / "tmp/image-build/images.tar").write_text("tarball")
     (root / "tmp/image-build/sub/verify.sh").write_text("solve steps")
     (root / "home/builder/.ssh/authorized_keys").write_text("ssh-ed25519 AAAA build-key\n")
@@ -114,6 +118,8 @@ def test_seal_linux_ssh_off_includes_socket(tmp_path):
         assert f"systemctl disable {unit}" in calls, calls
         assert f"systemctl mask {unit}" in calls, calls
     assert (root / "etc/ssh/sshd_not_to_be_run").is_file()
+    # The RHEL unit names are not touched on Debian/Ubuntu.
+    assert not [c for c in calls if " sshd." in c], calls
 
 
 def test_seal_linux_ssh_off_tolerates_missing_unit_only(tmp_path):
@@ -150,6 +156,10 @@ def test_seal_linux_keep_ssh(tmp_path):
     assert not (root / "tmp/image-build").exists()
     assert (root / "etc/machine-id").read_text() == ""
     assert not list((root / "etc/ssh").glob("ssh_host_*"))
+    # A KEEP_SSH=yes image is cloned with sshd on: each clone makes its own
+    # host keys when ssh.service starts (measured on pve2, two clones of
+    # enpm634-docker-host: different keys, written after first boot).
+    assert (root / "etc/systemd/system/ssh.service.d/10-regen-hostkeys.conf").is_file()
 
 
 def test_seal_linux_installs_hostkey_regen_dropin(tmp_path):
@@ -167,6 +177,70 @@ def test_seal_linux_installs_hostkey_regen_dropin(tmp_path):
         "ExecStartPre=/usr/bin/ssh-keygen -A",
         "ExecStartPre=/usr/sbin/sshd -t",
     ]
+
+
+# --- seal_linux.sh on the RHEL family (Rocky): sshd.service, sshd-keygen ----
+
+def test_seal_linux_ssh_off_rhel_units(tmp_path):
+    # RHEL's OpenSSH units are sshd.service and sshd.socket (also shipped,
+    # disabled). Neither honours sshd_not_to_be_run, so only disable+mask
+    # turns host SSH off there.
+    env = _seal_env(tmp_path, "rhel")
+    env["FAKE_SYSTEMCTL_MISSING"] = "ssh.service ssh.socket"
+    root = Path(env["SEAL_ROOT"])
+    result = _seal(tmp_path, env, "no")
+    assert result.returncode == 0, result.stderr
+    calls = _calls(tmp_path).splitlines()
+    for unit in ("sshd.service", "sshd.socket"):
+        assert f"systemctl disable {unit}" in calls, calls
+        assert f"systemctl mask {unit}" in calls, calls
+    assert not [c for c in calls if " ssh." in c], calls
+    assert not (root / "etc/ssh/sshd_not_to_be_run").exists()
+    assert not list((root / "etc/ssh").glob("ssh_host_*"))
+
+
+def test_seal_linux_rhel_needs_no_hostkey_dropin(tmp_path):
+    # sshd.service Wants sshd-keygen.target, whose sshd-keygen@ units make
+    # any missing host key before sshd starts; an ssh.service drop-in there
+    # would be a drop-in for a unit that does not exist.
+    for keep in ("no", "yes"):
+        env = _seal_env(tmp_path / keep, "rhel")
+        root = Path(env["SEAL_ROOT"])
+        result = _seal(tmp_path / keep, env, keep)
+        assert result.returncode == 0, result.stderr
+        assert not (root / "etc/systemd/system/ssh.service.d").exists(), keep
+        assert not (root / "etc/systemd/system/sshd.service.d").exists(), keep
+    assert "systemctl" not in _calls(tmp_path / "yes")
+
+
+def test_seal_linux_rhel_tolerates_missing_socket_only(tmp_path):
+    env = _seal_env(tmp_path, "rhel")
+    env["FAKE_SYSTEMCTL_MISSING"] = "sshd.socket"
+    result = _seal(tmp_path, env, "no")
+    assert result.returncode == 0, result.stderr
+    calls = _calls(tmp_path).splitlines()
+    assert "systemctl mask sshd.service" in calls, calls
+    assert "systemctl mask sshd.socket" not in calls, calls
+    for unit in ("sshd.socket", "sshd.service"):
+        env = _seal_env(tmp_path / unit, "rhel")
+        env["FAKE_SYSTEMCTL_FAIL"] = unit
+        result = _seal(tmp_path / unit, env, "no")
+        assert result.returncode != 0, unit
+        assert unit in result.stderr, (unit, result.stderr)
+
+
+def test_seal_linux_refuses_an_image_without_openssh_units(tmp_path):
+    # Neither ssh.service nor sshd.service: the seal cannot say what turns
+    # host SSH off, so it stops before it changes anything.
+    env = _seal_env(tmp_path)
+    root = Path(env["SEAL_ROOT"])
+    (root / "usr/lib/systemd/system/ssh.service").unlink()
+    for keep in ("no", "yes"):
+        result = _seal(tmp_path, env, keep)
+        assert result.returncode == 1, (keep, result.stderr)
+        assert "ssh.service" in result.stderr and "sshd.service" in result.stderr, result.stderr
+    assert (root / "tmp/image-build").exists()
+    assert _calls(tmp_path) == ""
 
 
 def test_seal_linux_fails_if_payload_survives(tmp_path):
@@ -1152,7 +1226,17 @@ def test_windows_remote_commands(tmp_path):
                for l in ssh), ssh
     scp = _remote_commands(calls, "scp")
     assert any(l.endswith(" Administrator@192.0.2.10:C:/image-build/payload.tgz") for l in scp), scp
+    assert any(l.endswith(" Administrator@192.0.2.10:C:/image-build/expand_payload.ps1") for l in scp), scp
     assert any(l.endswith(" Administrator@192.0.2.10:C:/image-build/seal_windows.ps1") for l in scp), scp
+    # tar.exe where Windows has it (Server 2019 and later), expand_payload.ps1 where it does not.
+    extract = [l for l in ssh if "payload.tgz" in l and "-xzf" in l]
+    assert len(extract) == 1, ssh
+    assert ("if (Get-Command tar.exe -ErrorAction SilentlyContinue) "
+            "{ tar.exe -xzf C:\\image-build\\payload.tgz -C C:\\image-build } "
+            "else { & C:\\image-build\\expand_payload.ps1 -Archive C:\\image-build\\payload.tgz "
+            "-Destination C:\\image-build }; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }") in extract[0], extract
+    remove = [l for l in ssh if "Remove-Item" in l and "payload.tgz" in l]
+    assert len(remove) == 1 and "Remove-Item -Force C:\\image-build\\expand_payload.ps1" in remove[0], ssh
     assert _events(calls, "setup.ps1", "verify.ps1", "seal_windows.ps1") == [
         "check_config", "resolve_base", "start", "upload", "setup", "verify", "seal", "save", "destroy"]
     assert "sudo" not in "".join(ssh)
@@ -1371,6 +1455,7 @@ UPLOAD_STEPS = {
               ("ssh", "rm -f /tmp/image-build/payload.tgz")),
     "windows": (("ssh", "New-Item -ItemType Directory -Force -Path C:\\image-build"),
                 ("scp", ":C:/image-build/payload.tgz"),
+                ("scp", ":C:/image-build/expand_payload.ps1"),
                 ("ssh", "tar.exe -xzf C:\\image-build\\payload.tgz"),
                 ("ssh", "Remove-Item -Force C:\\image-build\\payload.tgz")),
 }

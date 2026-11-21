@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 #
 # Create the Proxmox base template for Linux image builds,
-# base-ubuntu-2404-<yyyymmdd>, from the official Ubuntu 24.04 cloud image.
-# Runs on the build host, next to config.env, and reaches PVE_HOST as root
-# over SSH (key auth), as build_image.sh does.
+# base-ubuntu-<release>-<yyyymmdd>, from the official Ubuntu cloud image of
+# that release (2404 by default; 2204 and 2004 for labs whose packages need
+# an older release). Runs on the build host, next to config.env, and reaches
+# PVE_HOST as root over SSH (key auth), as build_image.sh does.
 #
 # Usage: scripts/image_build/proxmox_base_ubuntu.sh [--apply] [options]
-#   --image PATH      cloud image on PVE_NODE
-#                     (default /var/lib/vz/template/iso/noble-server-cloudimg-amd64.img)
+#   --release R       2004, 2204 or 2404 (default 2404): Ubuntu 20.04, 22.04
+#                     or 24.04
+#   --image PATH      cloud image on PVE_NODE (default
+#                     /var/lib/vz/template/iso/<codename>-server-cloudimg-amd64.img,
+#                     codename focal, jammy or noble from --release)
 #   --snippets STORE  storage with the `snippets` content type, for the
 #                     first-boot user-data (default local)
 #   --vmid N          VMID in 8000-8499 (default: the lowest V with V and
@@ -25,7 +29,8 @@
 #
 # The template meets the README's base-template contract:
 #   - user builder: passwordless sudo, password locked, no SSH key;
-#   - openssh-server (ssh.socket enabled) and qemu-guest-agent installed;
+#   - openssh-server (enabled: ssh.socket on 2404, ssh.service on 2004 and
+#     2204, the unit that owns port 22 on each) and qemu-guest-agent installed;
 #   - DHCP on any en*/eth* interface (netplan matched by name, not MAC:
 #     a clone has a new MAC and no cloud-init drive), cloud-init's own
 #     network config disabled;
@@ -52,7 +57,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${IMAGE_BUILD_CONFIG:-$SCRIPT_DIR/config.env}"
 
 APPLY=0
-IMAGE=/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img
+RELEASE=2404
+IMAGE=""
 SNIPPETS=local
 VMID=""
 DATE="$(date -u +%Y%m%d)"
@@ -71,16 +77,28 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --apply) APPLY=1 ;;
         --dry-run) APPLY=0 ;;
+        --release) RELEASE="${2?--release needs 2004, 2204 or 2404}"; shift ;;
         --image) IMAGE="${2:?--image needs a path}"; shift ;;
         --snippets) SNIPPETS="${2:?--snippets needs a storage}"; shift ;;
         --vmid) VMID="${2:?--vmid needs a VMID}"; shift ;;
         --date) DATE="${2:?--date needs YYYYMMDD}"; shift ;;
         --disk) DISK="${2:?--disk needs a size}"; shift ;;
-        -h|--help) sed -n '3,47p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '3,52p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'ERROR: unknown option %s\n' "$1" >&2; exit 2 ;;
     esac
     shift
 done
+
+# Ubuntu 22.10 moved port 22 to ssh.socket (socket activation). On 20.04 and
+# 22.04 ssh.service owns it, and enabling ssh.socket there as well makes the
+# two units conflict at boot.
+case "$RELEASE" in
+    2004) VERSION=20.04; CODENAME=focal; SSH_UNIT=ssh.service ;;
+    2204) VERSION=22.04; CODENAME=jammy; SSH_UNIT=ssh.service ;;
+    2404) VERSION=24.04; CODENAME=noble; SSH_UNIT=ssh.socket ;;
+    *) die "--release must be one of 2004 2204 2404 (got '$RELEASE')" ;;
+esac
+IMAGE="${IMAGE:-/var/lib/vz/template/iso/$CODENAME-server-cloudimg-amd64.img}"
 
 # --- config: only the PVE_ keys come back, as in build_image.sh ------------
 [ -f "$CONFIG" ] || die "config $CONFIG does not exist"
@@ -112,7 +130,7 @@ if [ -n "$VMID" ]; then
 fi
 command -v python3 >/dev/null || die "python3 is required"
 
-NAME="base-ubuntu-2404-$DATE"
+NAME="base-ubuntu-$RELEASE-$DATE"
 SNIPPET_FILE="$NAME-user.yaml"
 
 # --- remote layer ----------------------------------------------------------
@@ -202,10 +220,12 @@ say "  $PVE_NODE MemAvailable: $((avail_kib / 1024 / 1024)) GiB"
 say "  guests in 8000-8999 now:${in_block:+$'\n'$in_block}${in_block:- none}"
 
 # --- first-boot user-data: no key, no password -----------------------------
+# @RELEASE@ and @SSH_UNIT@ are filled in from --release; the rest is literal.
+fill() { sed -e "s/@RELEASE@/$RELEASE/g" -e "s/@SSH_UNIT@/$SSH_UNIT/g"; }
 user_data() {
-    cat <<'EOF'
+    fill <<'EOF'
 #cloud-config
-# base-ubuntu-2404 first boot (proxmox_base_ubuntu.sh). No keys, no passwords.
+# base-ubuntu-@RELEASE@ first boot (proxmox_base_ubuntu.sh). No keys, no passwords.
 users:
   - name: builder
     gecos: image builder
@@ -220,14 +240,14 @@ packages:
   - qemu-guest-agent
   - openssh-server
 runcmd:
-  - [systemctl, enable, ssh.socket]
+  - [systemctl, enable, @SSH_UNIT@]
   - [systemctl, start, qemu-guest-agent]
 EOF
 }
 
 # --- finalize, run as root in the guest through the agent ------------------
 finalize_script() {
-    cat <<'EOF'
+    fill <<'EOF'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 step() { printf '== %s\n' "$*"; }
@@ -239,7 +259,7 @@ runuser -u builder -- sudo -n true
 echo "builder: passwordless sudo ok"
 dpkg-query -W -f='${Package} ${Version}\n' qemu-guest-agent openssh-server
 systemctl is-active qemu-guest-agent
-systemctl is-enabled ssh.socket
+systemctl is-enabled @SSH_UNIT@
 
 step "network: DHCP on any en*/eth* interface, not keyed to this MAC"
 cat > /etc/netplan/01-image-build-dhcp.yaml <<'NETPLAN'
@@ -492,7 +512,7 @@ fi
 run qm template "$VMID"
 # A template is finished: from here a failure is reported, never destroyed.
 VM_ARMED=0
-run qm set "$VMID" --description "$NAME: Ubuntu 24.04 cloud image $(basename "$IMAGE") sha256 $image_sha, built $(date -u +%Y-%m-%d) by scripts/image_build/proxmox_base_ubuntu.sh. User builder: passwordless sudo, password locked, no key. No cloud-init drive, no host keys, empty machine-id." \
+run qm set "$VMID" --description "$NAME: Ubuntu $VERSION cloud image $(basename "$IMAGE") sha256 $image_sha, built $(date -u +%Y-%m-%d) by scripts/image_build/proxmox_base_ubuntu.sh. User builder: passwordless sudo, password locked, no key. No cloud-init drive, no host keys, empty machine-id." \
     || die "template $VMID is finished, but setting its description failed; it still reads 'under construction' with $RUN_TAG: set it by hand (qm set $VMID --description ...)"
 if [ "$APPLY" -eq 1 ]; then
     remove_snippet || exit 1

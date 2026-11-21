@@ -536,3 +536,204 @@ catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException };
     assert "final: StartPending Disabled" in out and "log: set Disabled; stop while StartPending" in out, out
     timeout = clone["WaitForStatusTimeout"]
     assert f"wait: {timeout['Type']}: {timeout['Message']}" in out, out
+
+
+# --- seal_windows.ps1: no host key shared between clones ----------------------
+# The Windows base ships without host keys and sshd writes any that are
+# missing when it starts (prepare.ps1 proves that on the base's own sshd), so
+# a base clone has its own. A lab build is a base clone: its sshd wrote the
+# build VM's keys, and the seal must delete them in both modes. With -KeepSsh
+# every clone of the image would otherwise present the build VM's host key;
+# without it each clone still carries the same private keys on disk, served
+# the moment anyone enables sshd. Measured on pve2 before this fix: two clones
+# of a base clone sealed with -KeepSsh served one and the same host key.
+
+SEAL_WINDOWS = IMAGE_BUILD / "seal_windows.ps1"
+HOST_KEYS = ("ssh_host_rsa_key", "ssh_host_rsa_key.pub", "ssh_host_ecdsa_key", "ssh_host_ecdsa_key.pub",
+             "ssh_host_ed25519_key", "ssh_host_ed25519_key.pub")
+
+
+def _seal_windows(tmp_path: Path, body: str):
+    """Dot-source seal_windows.ps1 -FunctionsOnly and run `body`. The seal
+    changes the machine it runs on (Administrator's password, the DHCP lease),
+    so the harness refuses a script that would act before the guard."""
+    text = SEAL_WINDOWS.read_text()
+    guard = text.find("if ($FunctionsOnly) { return }")
+    first = text.find("$sealPaths = ")
+    assert "[switch]$FunctionsOnly" in text and 0 < guard < first, \
+        "seal_windows.ps1 must return under -FunctionsOnly before it changes anything"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    script = tmp_path / "harness.ps1"
+    script.write_text("$ErrorActionPreference = 'Stop'\n"
+                      f". '{SEAL_WINDOWS}' -FunctionsOnly\n" + body, encoding="utf-8")
+    result = subprocess.run(_powershell() + ["-File", str(script)], capture_output=True, text=True, timeout=120)
+    return result, result.stdout + result.stderr
+
+
+def _ssh_dir(tmp_path: Path) -> Path:
+    """C:\\ProgramData\\ssh as the build VM leaves it before the seal."""
+    ssh = tmp_path / "ssh"
+    (ssh / "logs").mkdir(parents=True)
+    for name in HOST_KEYS:
+        (ssh / name).write_text(f"{name} of the build VM\n")
+    (ssh / "sshd_config").write_text("Match Group administrators\n")
+    (ssh / "logs" / "sshd.log").write_text("log\n")
+    return ssh
+
+
+def test_seal_windows_deletes_every_host_key(tmp_path):
+    ssh = _ssh_dir(tmp_path)
+    result, out = _seal_windows(tmp_path, f"Remove-SshHostKey -Directory '{ssh}'\n'done'\n")
+    assert result.returncode == 0, out
+    assert "done" in out, out
+    assert sorted(p.name for p in ssh.iterdir()) == ["logs", "sshd_config"], out
+    assert (ssh / "sshd_config").read_text() == "Match Group administrators\n"
+    assert (ssh / "logs" / "sshd.log").is_file()
+
+
+def test_seal_windows_host_keys_without_openssh(tmp_path):
+    # An image without OpenSSH has no C:\ProgramData\ssh: nothing to delete.
+    result, out = _seal_windows(tmp_path, f"Remove-SshHostKey -Directory '{tmp_path / 'absent'}'\n'done'\n")
+    assert result.returncode == 0 and "done" in out, out
+
+
+def test_seal_windows_fails_when_a_host_key_survives(tmp_path):
+    # A key the seal cannot delete fails the seal, so the image is not saved:
+    # here Remove-Item deletes nothing (the harness's function shadows the cmdlet).
+    ssh = _ssh_dir(tmp_path)
+    result, out = _seal_windows(tmp_path, "function Remove-Item { }\n"
+                                          f"Remove-SshHostKey -Directory '{ssh}'\n'not reached'\n")
+    assert result.returncode != 0, out
+    assert "not reached" not in out, out
+    assert "still present after removal" in out and "ssh_host_ed25519_key" in out, out
+    assert all((ssh / name).is_file() for name in HOST_KEYS)
+
+
+def test_seal_windows_deletes_host_keys_with_and_without_keep_ssh():
+    # One call, at the top level of the script: not inside the `if (-not
+    # $KeepSsh)` block, a function or a loop, so it runs in both modes.
+    parse = (
+        "$ast = [System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{SEAL_WINDOWS}', [ref]$null, [ref]$null)\n"
+        "$calls = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and "
+        "$n.GetCommandName() -eq 'Remove-SshHostKey' }, $true)\n"
+        "foreach ($c in $calls) { $p = $c.Parent; $up = @(); while ($p) { $up += $p.GetType().Name; $p = $p.Parent }\n"
+        "  'call: ' + $c.Extent.Text + ' | ' + ($up -join '<') }\n")
+    result = subprocess.run(_powershell() + ["-Command", parse], capture_output=True, text=True, timeout=120)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    calls = [l for l in out.splitlines() if l.startswith("call: ")]
+    assert len(calls) == 1, out
+    text, ancestry = calls[0][len("call: "):].split(" | ")
+    assert text == "Remove-SshHostKey -Directory 'C:\\ProgramData\\ssh'", text
+    # PipelineAst < NamedBlockAst < ScriptBlockAst: a statement of the script itself.
+    assert ancestry == "PipelineAst<NamedBlockAst<ScriptBlockAst", ancestry
+
+
+# A -KeepSsh image deleting its keys in the seal is not enough on Server 2016:
+# Win32-OpenSSH 10.0 (the MSI) registers sshd with "restart on failure", sshd
+# exits uncleanly when the save shuts the build VM down, the service manager
+# restarts it, and sshd writes new host keys into the image (measured on pve2:
+# two clones of a -KeepSsh seal of a base-ws2016 clone shared keys written at
+# the shutdown). So the seal also leaves sshd Manual and registers a startup
+# task, and the clone's first boot deletes whatever keys the image holds before
+# it starts sshd, which then writes its own.
+
+def _first_boot(tmp_path: Path, ssh: Path, start_writes_keys: bool):
+    """Run the first-boot script the seal writes, with sshd, Set-Service and
+    Unregister-ScheduledTask replaced by recording functions. The fake
+    Start-Service writes new keys when `start_writes_keys`, as sshd does. The
+    script runs in its own script scope, so the record is global."""
+    write = "\n".join(f"Set-Content -LiteralPath '{ssh / n}' -Value 'new {n}'" for n in HOST_KEYS)
+    body = (
+        "$global:log = @()\n"
+        "function New-ScheduledTaskAction { param($Execute, $Argument) }\n"
+        "function New-ScheduledTaskTrigger { param([switch]$AtStartup) }\n"
+        "function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) }\n"
+        "function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, [switch]$Force) }\n"
+        "function Set-Service { param($Name, $StartupType) $global:log += \"set $Name $StartupType\" }\n"
+        "function Start-Service { param($Name) $global:log += \"start $Name keys=$(@(Get-ChildItem "
+        f"'{ssh}\\ssh_host_*').Count)\"\n" + (write + "\n" if start_writes_keys else "") + "}\n"
+        "function Unregister-ScheduledTask { param($TaskName, $Confirm) $global:log += \"unregister $TaskName\" }\n"
+        # Every command that would touch this host is shadowed before the seal's function runs.
+        f"Register-SshHostKeyFirstBoot -Directory '{ssh}' -TaskName 'image-build-ssh-host-keys'\n"
+        "$global:log = @()\n"
+        f"try {{ & '{ssh / 'first-boot-host-keys.ps1'}'; 'first boot: ok' }} catch {{ \"first boot: $($_.Exception.Message)\" }}\n"
+        "$global:log | ForEach-Object { \"log: $_\" }\n")
+    return _seal_windows(tmp_path, body)
+
+
+def test_seal_windows_first_boot_replaces_the_image_host_keys(tmp_path):
+    ssh = _ssh_dir(tmp_path)
+    result, out = _first_boot(tmp_path, ssh, start_writes_keys=True)
+    assert result.returncode == 0, out
+    assert "first boot: ok" in out, out
+    # The image's keys are gone before sshd starts, and sshd's own are left.
+    assert [l for l in out.splitlines() if l.startswith("log: ")] == [
+        "log: set sshd Automatic", "log: start sshd keys=0", "log: unregister image-build-ssh-host-keys"], out
+    assert all((ssh / n).read_text().strip() == f"new {n}" for n in HOST_KEYS), out
+    assert (ssh / "sshd_config").is_file()
+    # The step removes itself: the script file and (above) the task.
+    assert not (ssh / "first-boot-host-keys.ps1").exists(), out
+
+
+def test_seal_windows_first_boot_keeps_its_task_when_sshd_writes_no_key(tmp_path):
+    # sshd started but wrote no host key: the step fails and stays registered,
+    # so the next boot tries again.
+    ssh = _ssh_dir(tmp_path)
+    result, out = _first_boot(tmp_path, ssh, start_writes_keys=False)
+    assert result.returncode == 0, out
+    assert "first boot: sshd wrote no host key" in out, out
+    assert "log: unregister" not in out, out
+    assert (ssh / "first-boot-host-keys.ps1").is_file(), out
+
+
+def test_seal_windows_registers_the_first_boot_step(tmp_path):
+    ssh = tmp_path / "ssh"
+    ssh.mkdir()
+    body = (
+        "$global:log = @()\n"
+        "function New-ScheduledTaskAction { param($Execute, $Argument) \"action $Execute $Argument\" }\n"
+        "function New-ScheduledTaskTrigger { param([switch]$AtStartup) \"trigger AtStartup=$AtStartup\" }\n"
+        "function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) \"principal $UserId $LogonType $RunLevel\" }\n"
+        "function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, [switch]$Force)\n"
+        "  $global:log += \"register $TaskName | $Action | $Trigger | $Principal | Force=$Force\" }\n"
+        "function Set-Service { param($Name, $StartupType) $global:log += \"set $Name $StartupType\" }\n"
+        f"Register-SshHostKeyFirstBoot -Directory '{ssh}' -TaskName 'image-build-ssh-host-keys'\n"
+        "$global:log | ForEach-Object { \"log: $_\" }\n")
+    result, out = _seal_windows(tmp_path, body)
+    assert result.returncode == 0, out
+    script = ssh / "first-boot-host-keys.ps1"
+    assert script.is_file(), out
+    log = [l[len("log: "):] for l in out.splitlines() if l.startswith("log: ")]
+    assert log == [
+        "register image-build-ssh-host-keys | action powershell.exe -NoProfile -NonInteractive "
+        f"-ExecutionPolicy Bypass -File \"{script}\" | trigger AtStartup=True | "
+        "principal NT AUTHORITY\\SYSTEM ServiceAccount Highest | Force=True",
+        # Registered first: sshd is left Manual only once the step that starts it exists.
+        "set sshd Manual",
+    ], out
+
+
+def test_seal_windows_registers_the_first_boot_step_only_with_keep_ssh():
+    # Without -KeepSsh sshd is disabled, so the service manager cannot restart
+    # it at the shutdown, and a clone has no sshd to give keys to.
+    parse = (
+        "$ast = [System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{SEAL_WINDOWS}', [ref]$null, [ref]$null)\n"
+        "$calls = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and "
+        "$n.GetCommandName() -in 'Register-SshHostKeyFirstBoot', 'Set-Service' }, $true)\n"
+        "foreach ($c in $calls) { $if = $c.Parent; while ($if -and $if -isnot [System.Management.Automation.Language.IfStatementAst]) { $if = $if.Parent }\n"
+        "  $where = 'top'\n"
+        "  if ($if) { $i = 0; foreach ($cl in $if.Clauses) { if ($cl.Item2.Extent.StartOffset -le $c.Extent.StartOffset -and $c.Extent.EndOffset -le $cl.Item2.Extent.EndOffset) { $where = 'if ' + $cl.Item1.Extent.Text } }\n"
+        "    if ($where -eq 'top' -and $if.ElseClause) { $where = 'else of ' + $if.Clauses[0].Item1.Extent.Text } }\n"
+        "  $fn = $c.Parent; while ($fn -and $fn -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $fn = $fn.Parent }\n"
+        "  if (-not $fn) { 'call: ' + $c.Extent.Text + ' | ' + $where } }\n")
+    result = subprocess.run(_powershell() + ["-Command", parse], capture_output=True, text=True, timeout=120)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert [l for l in out.splitlines() if l.startswith("call: ")] == [
+        "call: Register-SshHostKeyFirstBoot -Directory 'C:\\ProgramData\\ssh' -TaskName 'image-build-ssh-host-keys'"
+        " | if $KeepSsh",
+        "call: Set-Service sshd -StartupType Disabled | else of $KeepSsh",
+    ], out

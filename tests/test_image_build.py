@@ -156,6 +156,10 @@ def test_seal_linux_keep_ssh(tmp_path):
     assert not (root / "tmp/image-build").exists()
     assert (root / "etc/machine-id").read_text() == ""
     assert not list((root / "etc/ssh").glob("ssh_host_*"))
+    # A KEEP_SSH=yes image is cloned with sshd on: each clone makes its own
+    # host keys when ssh.service starts (measured on pve2, two clones of
+    # enpm634-docker-host: different keys, written after first boot).
+    assert (root / "etc/systemd/system/ssh.service.d/10-regen-hostkeys.conf").is_file()
 
 
 def test_seal_linux_installs_hostkey_regen_dropin(tmp_path):

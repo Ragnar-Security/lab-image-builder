@@ -117,7 +117,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   clone's first boot the task makes the clone's own keys with `ssh-keygen -A`,
   checks they exist and differ from the image's, and only then sets sshd
   `Automatic` and starts it; on failure sshd stays `Manual` and stopped and
-  the task retries at the next boot (5 attempts). The task's script and
+  the task retries at the next boot (5 attempts). Once sshd runs on the new
+  keys, the cleanup (unregister the task, delete the script, log) is best
+  effort and never stops sshd. The task's script and
   directory, the task and its file are administrators-only, and the seal
   reads that back and fails otherwise. `seal_linux.sh` already deleted the
   keys in both modes.

@@ -652,6 +652,15 @@ function global:Start-Service { param($Name)
 function global:Unregister-ScheduledTask { param($TaskName, $Confirm)
     if ($global:unregisterFails) { throw 'access denied' }
     $global:log += "unregister $TaskName" }
+# Deleting the script, or writing first-boot.log, fails on demand; everything
+# else goes to the real cmdlet. eventcreate.exe (the fallback log) is recorded.
+function global:Remove-Item { [CmdletBinding()] param([string]$LiteralPath, [switch]$Force, [switch]$Recurse)
+    if ($global:removeFails -and $LiteralPath -like '*first-boot-host-keys.ps1') { throw 'the file is in use' }
+    Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters }
+function global:Add-Content { [CmdletBinding()] param([string]$LiteralPath, [object]$Value)
+    if ($global:logFails -and $LiteralPath -like '*first-boot.log') { throw 'the disk is full' }
+    Microsoft.PowerShell.Management\Add-Content @PSBoundParameters }
+function global:eventcreate.exe { $global:log += "event: $($args[-1] -replace '^\S+ \S+ ', '')" }
 """
 
 # ssh-keygen -A as the clone runs it, played by a script: 'ok' writes three new
@@ -703,7 +712,8 @@ def _fingerprints(ssh: Path) -> dict:
 
 def _first_boot(tmp_path: Path, runs: list):
     """Write the first-boot script the seal would write, then run it once per
-    entry of `runs` (each sets keygen, startFails, unregisterFails; `rewrite`
+    entry of `runs` (each sets keygen, startFails, unregisterFails, removeFails,
+    logFails; `rewrite`
     puts the script back first, as if the task fired again after it had
     removed both), with
     sshd, the service cmdlets and Unregister-ScheduledTask played by recording
@@ -723,7 +733,8 @@ def _first_boot(tmp_path: Path, runs: list):
         body += (
             (f"Set-Content -LiteralPath '{script}' -Value $text -Encoding UTF8\n" if run.get("rewrite") else "") +
             f"$global:keygenMode = '{run.get('keygen', 'ok')}'; $global:startFails = ${bool(run.get('start_fails'))}; "
-            f"$global:unregisterFails = ${bool(run.get('unregister_fails'))}\n"
+            f"$global:unregisterFails = ${bool(run.get('unregister_fails'))}; "
+            f"$global:removeFails = ${bool(run.get('remove_fails'))}; $global:logFails = ${bool(run.get('log_fails'))}\n"
             f"$global:log += '-- run {i}'; $global:LASTEXITCODE = 0\n"
             f"& '{script}'\n"
             f"$global:log += \"exit $LASTEXITCODE; sshd $global:sshdStatus $global:startType; "
@@ -794,19 +805,55 @@ def test_first_boot_after_success_never_touches_the_keys_again(tmp_path):
     assert "attempt 3: keys were made on an earlier attempt; not touched" in text, text
 
 
-def test_first_boot_keeps_its_script_until_the_task_is_gone(tmp_path):
-    # The task cannot be unregistered: the script stays, so the task's next
-    # run (next boot) still has something to run, and finishes the job. The
-    # other order would leave a task with no script, and sshd off for good.
+# Once sshd runs on the clone's verified keys, cleanup is best effort: no
+# failure in it stops sshd or touches the keys (the task may already be gone,
+# and then nothing would retry).
+
+SUCCESS = ["-- run 1", "set sshd Manual", "keygen -A sshd=Stopped keys=0", "set sshd Automatic",
+           "start sshd type=Automatic keys=6"]
+
+
+def test_first_boot_unregister_failure_keeps_sshd_and_retries_only_the_cleanup(tmp_path):
+    # The task cannot be unregistered: sshd keeps running, the script stays, so
+    # the task's next run (next boot) still has something to run. That run makes
+    # no keys and only cleans up.
     _image_keys(tmp_path)
     result, out, log, fb = _first_boot(tmp_path, [{"unregister_fails": True}, {}])
     assert result.returncode == 0, out
-    assert log[-9:] == [
-        "start sshd type=Automatic keys=6", "set sshd Manual", "stop sshd",
-        "exit 1; sshd Stopped Manual; script True",
+    assert log == SUCCESS + [
+        "exit 0; sshd Running Automatic; script True",
         "-- run 2", "set sshd Automatic", "start sshd type=Automatic keys=6",
         "unregister image-build-ssh-host-keys", "exit 0; sshd Running Automatic; script False",
     ], out
+    assert sorted(_fingerprints(tmp_path / "ssh").values()) == sorted((fb / "keys-generated").read_text().split())
+    text = (fb / "first-boot.log").read_text()
+    assert "the task could not be unregistered (access denied); the script stays" in text, text
+    assert "attempt 2: keys were made on an earlier attempt; not touched" in text, text
+
+
+def test_first_boot_script_delete_failure_keeps_sshd(tmp_path):
+    # The task is gone and the script cannot be deleted: sshd keeps running and
+    # the script is left, inert (no task runs it; its directory is admin-only).
+    _image_keys(tmp_path)
+    result, out, log, fb = _first_boot(tmp_path, [{"remove_fails": True}])
+    assert result.returncode == 0, out
+    assert log == SUCCESS + ["unregister image-build-ssh-host-keys", "exit 0; sshd Running Automatic; script True"], out
+    text = (fb / "first-boot.log").read_text()
+    assert "task removed; the script could not be deleted (the file is in use) and is inert" in text, text
+
+
+def test_first_boot_log_failure_keeps_sshd(tmp_path):
+    # first-boot.log cannot be written: every line goes to the Application
+    # event log instead, and sshd keeps running.
+    _image_keys(tmp_path)
+    result, out, log, fb = _first_boot(tmp_path, [{"log_fails": True}])
+    assert result.returncode == 0, out
+    events = [l for l in log if l.startswith("event: ")]
+    assert [l for l in log if not l.startswith("event: ")] == SUCCESS + [
+        "unregister image-build-ssh-host-keys", "exit 0; sshd Running Automatic; script False"], out
+    assert len(events) == 2 and "attempt 1: new host keys" in events[0], out
+    assert "attempt 1: sshd Automatic and running; task and script removed" in events[1], out
+    assert not (fb / "first-boot.log").exists()
 
 
 def test_first_boot_gives_up_after_five_attempts(tmp_path):

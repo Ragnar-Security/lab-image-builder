@@ -103,15 +103,21 @@ function Set-TaskSddl {
 # uncleanly at the shutdown, the service manager restarts it, and it writes
 # new keys into the image (measured on pve2: two clones then shared them).
 # So sshd is left Manual, and a startup task runs this script as SYSTEM on
-# the clone's first boot. It records the image's key fingerprints, deletes the
-# keys, makes new ones with `ssh-keygen -A` (sshd stopped), checks that every
-# type exists and differs from the image's, records success, and only then
-# sets sshd Automatic and starts it. On any failure sshd is left Manual and
-# stopped, the failure is logged, and the task stays for the next boot, up to
-# 5 attempts. After a success the keys are never touched again. On success the
-# task is unregistered first and the script deleted second: a task left
-# behind would point at a path, while a script left behind is inert in a
-# directory only administrators can write.
+# the clone's first boot, in two phases:
+#   1. Keys: record the image's key fingerprints, delete the keys, make new
+#      ones with `ssh-keygen -A` (sshd stopped), check that every type exists
+#      and differs from the image's, record success, then set sshd Automatic
+#      and start it. Any failure here leaves sshd Manual and stopped, is
+#      logged, and the task stays for the next boot: up to 5 attempts at the
+#      keys. Once keys exist they are never touched again; a later run only
+#      starts sshd.
+#   2. Cleanup, once sshd runs on the clone's own keys: unregister the task,
+#      then delete the script, then log. Each step is best effort and never
+#      stops sshd. If the task cannot be unregistered the script stays, so the
+#      next boot runs it again (it only starts sshd and cleans up). A script
+#      left without its task is inert in a directory only administrators can
+#      write. When the log cannot be written, the line goes to the Application
+#      event log.
 $FirstBootScript = @'
 # First boot of a clone of a KEEP_SSH=yes image, written by seal_windows.ps1:
 # this clone's own sshd host keys, then sshd on, then this step removed.
@@ -122,7 +128,14 @@ $types = 'rsa', 'ecdsa', 'ed25519'
 $done = Join-Path $dir 'keys-generated'
 $imageKeys = Join-Path $dir 'image-fingerprints'
 $attempts = Join-Path $dir 'attempts'
-function Log($m) { Add-Content -LiteralPath (Join-Path $dir 'first-boot.log') -Value ('{0:u} {1}' -f (Get-Date).ToUniversalTime(), $m) }
+# Never throws: the log beside this script, else the Application event log.
+function Log($m) {
+    $line = '{0:u} {1}' -f (Get-Date).ToUniversalTime(), $m
+    try { Add-Content -LiteralPath (Join-Path $dir 'first-boot.log') -Value $line }
+    catch {
+        try { & eventcreate.exe /T WARNING /ID 100 /L APPLICATION /SO image-build-first-boot /D $line | Out-Null } catch { }
+    }
+}
 function Fingerprint($pub) {
     $blob = [Convert]::FromBase64String(((Get-Content -LiteralPath $pub -TotalCount 1) -split '\s+')[1])
     'SHA256:' + [Convert]::ToBase64String([Security.Cryptography.SHA256]::Create().ComputeHash($blob)).TrimEnd('=')
@@ -132,19 +145,21 @@ function Stop-Sshd {
     Set-Service sshd -StartupType Manual
     if ((Get-Service sshd).Status -ne 'Stopped') { Stop-Service sshd -Force }
 }
+
+# Phase 1: the clone's own keys, then sshd on.
 try {
     $n = 1 + [int](@(Get-Content -LiteralPath $attempts -ErrorAction SilentlyContinue) | Select-Object -First 1)
     Set-Content -LiteralPath $attempts -Value $n
-    if ($n -gt $maxAttempts) {
-        Log "giving up after $maxAttempts attempts; sshd stays Manual and stopped"
-        Stop-Sshd
-        Unregister-ScheduledTask -TaskName $task -Confirm:$false
-        Remove-Item -LiteralPath $PSCommandPath -Force
-        exit 1
-    }
     if (Test-Path -LiteralPath $done) {
         Log "attempt ${n}: keys were made on an earlier attempt; not touched"
     } else {
+        if ($n -gt $maxAttempts) {
+            Log "giving up after $maxAttempts attempts; sshd stays Manual and stopped"
+            Stop-Sshd
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
+            Remove-Item -LiteralPath $PSCommandPath -Force
+            exit 1
+        }
         Stop-Sshd
         $old = @(Get-ChildItem -Path (Join-Path $ssh 'ssh_host_*_key.pub') -Force | ForEach-Object { Fingerprint $_.FullName })
         if ($old.Count) { Add-Content -LiteralPath $imageKeys -Value $old }
@@ -169,14 +184,27 @@ try {
     }
     Set-Service sshd -StartupType Automatic
     Start-Service sshd
-    Unregister-ScheduledTask -TaskName $task -Confirm:$false
-    Remove-Item -LiteralPath $PSCommandPath -Force
-    Log "attempt ${n}: sshd Automatic and running; task and script removed"
 } catch {
     Log "attempt ${n} failed: $($_.Exception.Message)"
     try { Stop-Sshd } catch { Log "and sshd could not be left Manual and stopped: $($_.Exception.Message)" }
     exit 1
 }
+
+# Phase 2: sshd runs on this clone's own keys. Nothing below stops it or
+# touches the keys; every step is best effort.
+try {
+    Unregister-ScheduledTask -TaskName $task -Confirm:$false
+} catch {
+    Log "attempt ${n}: sshd Automatic and running; the task could not be unregistered ($($_.Exception.Message)); the script stays, so the next boot runs it again and only cleans up"
+    exit 0
+}
+try {
+    Remove-Item -LiteralPath $PSCommandPath -Force
+    Log "attempt ${n}: sshd Automatic and running; task and script removed"
+} catch {
+    Log "attempt ${n}: sshd Automatic and running; task removed; the script could not be deleted ($($_.Exception.Message)) and is inert"
+}
+exit 0
 '@
 
 # The first-boot script for these paths, as text.

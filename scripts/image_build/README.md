@@ -341,12 +341,18 @@ SYSTEM:
   fingerprints of whatever keys the image holds, deletes them, runs
   `ssh-keygen -A` with sshd stopped, and checks that an RSA, ECDSA and Ed25519
   pair exist and differ from the image's. Only then does it set sshd
-  `Automatic`, start it, unregister the task and delete itself (in that
-  order, so a task never outlives its script). On any failure sshd stays
-  `Manual` and stopped, the failure goes to `first-boot.log` beside the
-  script, and the task runs again at the next boot, up to 5 attempts. Once
-  keys have been made they are never deleted again: a later run only starts
-  sshd and cleans up.
+  `Automatic` and start it. Any failure up to that point leaves sshd `Manual`
+  and stopped, goes to `first-boot.log` beside the script, and the task runs
+  again at the next boot, up to 5 attempts at the keys. Once keys have been
+  made they are never deleted again: a later run only starts sshd and cleans
+  up.
+- **Cleanup never stops sshd.** Once sshd runs on the clone's own keys, the
+  script unregisters the task, then deletes itself, then logs; each step is
+  best effort. If the task cannot be unregistered, the script stays and the
+  next boot runs it again (it only cleans up). A script whose task is gone but
+  which cannot be deleted is inert in its administrators-only directory. A
+  line that cannot be written to `first-boot.log` goes to the Application
+  event log (source `image-build-first-boot`).
 
 ## Windows recipes
 

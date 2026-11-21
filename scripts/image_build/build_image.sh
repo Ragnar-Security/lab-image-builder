@@ -430,10 +430,14 @@ remote_upload() {
     upload_step "$deadline" "create C:\\image-build" \
       remote_run 'New-Item -ItemType Directory -Force -Path C:\image-build | Out-Null'
     upload_step "$deadline" "copy payload.tgz" rscp "$TMP_DIR/payload.tgz" C:/image-build/payload.tgz
+    # Windows Server 2016 and older have no tar.exe: expand_payload.ps1 then
+    # extracts the archive with .NET. It is removed with the archive.
+    upload_step "$deadline" "copy expand_payload.ps1" \
+      rscp "$SCRIPT_DIR/expand_payload.ps1" C:/image-build/expand_payload.ps1
     upload_step "$deadline" "extract payload.tgz" \
-      remote_run 'tar.exe -xzf C:\image-build\payload.tgz -C C:\image-build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
+      remote_run 'if (Get-Command tar.exe -ErrorAction SilentlyContinue) { tar.exe -xzf C:\image-build\payload.tgz -C C:\image-build } else { & C:\image-build\expand_payload.ps1 -Archive C:\image-build\payload.tgz -Destination C:\image-build }; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
     upload_step "$deadline" "remove payload.tgz" \
-      remote_run 'if (Test-Path C:\image-build\payload.tgz) { Remove-Item -Force C:\image-build\payload.tgz }'
+      remote_run 'if (Test-Path C:\image-build\payload.tgz) { Remove-Item -Force C:\image-build\payload.tgz }; if (Test-Path C:\image-build\expand_payload.ps1) { Remove-Item -Force C:\image-build\expand_payload.ps1 }'
   fi
 }
 

@@ -310,7 +310,23 @@ The RHEL family needs no drop-in: `sshd.service` wants `sshd-keygen.target`,
 whose `sshd-keygen@` units make every missing host key before sshd starts.
 
 On Windows, `seal_windows.ps1` disables the `sshd` service unless `-KeepSsh`
-is passed (which the core does for `KEEP_SSH=yes`).
+is passed (which the core does for `KEEP_SSH=yes`). In both modes it deletes
+sshd's host keys (`C:\ProgramData\ssh\ssh_host_*`) and fails the seal if one
+survives; sshd writes any missing host key when it starts (the Windows base
+proves it in `prepare.ps1`). Without `-KeepSsh` that is all a clone needs:
+sshd is disabled, and writes its own keys if it is ever enabled.
+
+With `-KeepSsh`, deleting them is not enough. sshd keeps running until the
+save shuts the build VM down, and Win32-OpenSSH 10.0 (the Server 2016 base)
+registers sshd with "restart on failure": sshd exits uncleanly at the
+shutdown, the service manager restarts it, and it writes new keys into the
+image (measured on pve2: two clones of such an image shared them). So the
+seal also writes `C:\ProgramData\ssh\first-boot-host-keys.ps1`, registers a
+startup task `image-build-ssh-host-keys` that runs it as SYSTEM, and leaves
+sshd `Manual`. On a clone's first boot the task deletes whatever host keys
+the image holds, sets sshd `Automatic` and starts it, so sshd writes the
+clone's own keys, and then removes the task and the script. If sshd writes
+no key, both stay and the next boot tries again.
 
 ## Windows recipes
 
@@ -332,8 +348,9 @@ is passed (which the core does for `KEEP_SSH=yes`).
   payload fails the build at the upload.
   Both files are deleted after the extract, so a payload may not hold either
   name at its root.
-- `seal_windows.ps1` deletes `C:\image-build` and
-  `C:\ProgramData\ssh\administrators_authorized_keys`, then sets the local
+- `seal_windows.ps1` deletes `C:\image-build`,
+  `C:\ProgramData\ssh\administrators_authorized_keys` and sshd's host keys
+  (see "Host SSH" above), then sets the local
   `Administrator` password to a random 32-character value generated in the
   guest. The value is held in a `SecureString` and is never printed or stored.
 - It also deletes the cached DHCP lease values under

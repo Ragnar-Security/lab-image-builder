@@ -285,21 +285,29 @@ On Linux, `seal_linux.sh <yes|no>` always removes the payload, empties
 `cloud-init clean --logs` when cloud-init is present, empties
 `/etc/machine-id`, deletes the host keys, and empties shell history. Locking
 `builder`'s password does not stop the next build on a `KEEP_SSH=yes` base:
-with `UsePAM yes` (Ubuntu's default) sshd still accepts a public key for a
-password-locked account.
+with `UsePAM yes` (Ubuntu's and Rocky's default) sshd still accepts a public
+key for a password-locked account.
+
+The seal first tells the OpenSSH packaging apart by the unit file it ships
+(under `/usr/lib/systemd/system` or `/lib/systemd/system`): `ssh.service` on
+Debian and Ubuntu, `sshd.service` on the RHEL family (Rocky). An image with
+neither stops the seal (exit 1) before it changes anything.
 
 With `keep_ssh=no` it also turns host SSH off. Since Ubuntu 22.10 `ssh.socket`
-owns port 22 and starts `ssh.service` on demand, so the seal disables and
-masks both units (a unit that does not exist, such as `ssh.socket` on an older
-base, is skipped; any other `systemctl` failure fails the seal) and writes
-`/etc/ssh/sshd_not_to_be_run`, which both units also honour. RHEL's `sshd`
-unit is not handled.
+owns port 22 and starts `ssh.service` on demand, so on Debian and Ubuntu the
+seal disables and masks both units (a unit that does not exist, such as
+`ssh.socket` on an older base, is skipped; any other `systemctl` failure fails
+the seal) and writes `/etc/ssh/sshd_not_to_be_run`, which both units also
+honour. On the RHEL family it disables and masks `sshd.service` and
+`sshd.socket` the same way; those units honour no such file.
 
-Whenever it deletes the host keys it installs a systemd drop-in
-(`ssh.service.d/10-regen-hostkeys.conf`) that resets `ExecStartPre=` and runs
-`ssh-keygen -A` and then `sshd -t`. The reset matters: the unit's own
+Whenever it deletes the host keys on Debian or Ubuntu it installs a systemd
+drop-in (`ssh.service.d/10-regen-hostkeys.conf`) that resets `ExecStartPre=`
+and runs `ssh-keygen -A` and then `sshd -t`. The reset matters: the unit's own
 `ExecStartPre=/usr/sbin/sshd -t` would otherwise run first and fail with no
 host keys. A clone therefore gets new host keys on a base without cloud-init.
+The RHEL family needs no drop-in: `sshd.service` wants `sshd-keygen.target`,
+whose `sshd-keygen@` units make every missing host key before sshd starts.
 
 On Windows, `seal_windows.ps1` disables the `sshd` service unless `-KeepSsh`
 is passed (which the core does for `KEEP_SSH=yes`).
@@ -524,25 +532,50 @@ starts `sshd`. `proxmox_base_windows.sh` builds such a base (below).
 #### Building the Linux base: `proxmox_base_ubuntu.sh`
 
 `scripts/image_build/proxmox_base_ubuntu.sh` builds a Linux base that meets
-this contract, `base-ubuntu-2404-<yyyymmdd>`, from the official Ubuntu 24.04
-cloud image. It runs on the build host, reads the same `config.env`
+this contract, `base-ubuntu-<release>-<yyyymmdd>`, from the official Ubuntu
+cloud image of that release: `--release 2404` (24.04, the default), `2204`
+(22.04) or `2004` (20.04), for a lab whose packages exist only on an older
+release (PHP 7.4 is in 20.04's archive and in no later one). It runs on the
+build host, reads the same `config.env`
 (`IMAGE_BUILD_CONFIG` overrides the path), and reaches `root@PVE_HOST` over
 SSH as the builder does. It uses five keys: `PVE_HOST`, `PVE_NODE`,
 `PVE_STORAGE` (the template's disk), `PVE_BUILD_BRIDGE` and `PVE_BUILD_VLAN`.
 
 ```
-scripts/image_build/proxmox_base_ubuntu.sh [--image PATH] [--snippets STORE]   # dry run
-scripts/image_build/proxmox_base_ubuntu.sh --apply [--image PATH] [--snippets STORE]
+scripts/image_build/proxmox_base_ubuntu.sh [--release R] [--snippets STORE]   # dry run
+scripts/image_build/proxmox_base_ubuntu.sh --apply [--release R] [--snippets STORE]
 ```
 
 **It is a dry run by default.** Without `--apply` it runs only the read-only
 checks and prints every command that would change the cluster, the user-data
-and the in-guest finalize script. Options: `--image` (the cloud image on
-`PVE_NODE`, default
-`/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img`), `--snippets` (a
+and the in-guest finalize script. Options: `--release` (`2004`, `2204` or
+`2404`, default `2404`), `--image-url` and `--sha256` (another pinned image,
+below), `--image` (a file already on `PVE_NODE` to use instead; it must hash
+to `--sha256` or the release's pin), `--snippets` (a
 storage with the `snippets` content type, default `local`), `--vmid`,
 `--date` (default today, UTC) and `--disk` (default `20G`; the backend does
 not resize, so this is every image's disk size).
+
+**The cloud image is pinned.** Each release has one pinned image: a URL in a
+dated release directory (never `current/`, whose file changes under the same
+name) and the SHA-256 Ubuntu publishes for it in that directory's
+`SHA256SUMS`:
+
+| `--release` | Pinned image | SHA-256 |
+|---|---|---|
+| `2004` | `https://cloud-images.ubuntu.com/releases/focal/release-20250624/ubuntu-20.04-server-cloudimg-amd64.img` (20.04's last) | `18f2977d77dfea1b74aee14533bd21c34f789139e949c57023b7364894b7e5e9` |
+| `2204` | `https://cloud-images.ubuntu.com/releases/jammy/release-20261109/ubuntu-22.04-server-cloudimg-amd64.img` | `77d19e53656f87c95f1f6c6be59c789083b3f77fa08f9d88011ee04085c61f87` |
+| `2404` | `https://cloud-images.ubuntu.com/releases/noble/release-20260911/ubuntu-24.04-server-cloudimg-amd64.img` (what `base-ubuntu-2404-20261113` was built from) | `612b2c0cc1bc413a6cb8c38fd611794caf0f2b436c50013d8b3794db12ad7354` |
+
+On the node the image lives at
+`/var/lib/vz/template/iso/<codename>-server-cloudimg-amd64-<serial>.img`;
+with `--apply` the script fetches it there when it is absent (to a `.part`
+file, moved into place only once its SHA-256 is the pinned one). **The check
+fails closed:** a file on the node or a download whose SHA-256 is not the
+pinned one stops the run before anything is created, so a rebuild cannot
+silently start from different bytes. The packages the first boot installs
+still come from the release's live archive (and are upgraded there), so a
+rebuild pins the image, not every package.
 
 **VMID.** The lowest `V` in `8000`-`8499` with both `V` and `V+500` free
 anywhere in the cluster, so the replica can sit at `V+500`. `--vmid` is
@@ -559,8 +592,11 @@ access there: the first boot upgrades the image and installs packages.
 **What it does.** It writes a first-boot user-data snippet (no key, no
 password) to the snippets storage, creates the VM, imports the cloud image as
 its disk and boots it with a cloud-init drive pointing at the snippet.
-cloud-init creates `builder` and installs `qemu-guest-agent` and
-`openssh-server`. The rest runs as root through the guest agent: a netplan
+cloud-init creates `builder`, installs `qemu-guest-agent` and
+`openssh-server`, and enables the unit that owns port 22 on that release
+(`ssh.socket` on 24.04; `ssh.service` on 20.04 and 22.04, where enabling
+`ssh.socket` too makes the two conflict). The rest runs as root through the
+guest agent: a netplan
 file that gives DHCP to any `en*`/`eth*` interface, matched by name rather
 than MAC (a clone has a new MAC), with cloud-init's own network config
 disabled; no SSH host keys (a drop-in runs `ssh-keygen -A` when `ssh.service`
@@ -583,19 +619,26 @@ a VM the run could not destroy (a lost connection, say) can be identified
 and removed by hand. The snippet is deleted on every exit; if the node cannot
 confirm it is gone, the run exits non-zero with an error naming its path.
 
-**Rebuilding for a new point release.** Ubuntu refreshes the 24.04 cloud
-image for each point release and between them for security updates. On
-`PVE_NODE`, replace the image at the `--image` path with the current one and
-check it against Ubuntu's published `SHA256SUMS` (the `noble/current/`
-directory keeps the file name the script expects):
+**Rebuilding for a new point release.** Ubuntu publishes a new dated image
+for each point release and between them for security updates. To move a
+release to one, pick its `release-<serial>/` directory under
+`https://cloud-images.ubuntu.com/releases/<codename>/`, take the image's
+line from that directory's `SHA256SUMS`, and pass both:
 
 ```
-cd /var/lib/vz/template/iso
-wget -O noble-server-cloudimg-amd64.img \
-  https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
-wget -O SHA256SUMS https://cloud-images.ubuntu.com/noble/current/SHA256SUMS
-grep ' \*noble-server-cloudimg-amd64.img$' SHA256SUMS | sha256sum -c -
+scripts/image_build/proxmox_base_ubuntu.sh --release 2404 \
+  --image-url https://cloud-images.ubuntu.com/releases/noble/release-<serial>/ubuntu-24.04-server-cloudimg-amd64.img \
+  --sha256 <its SHA-256 from SHA256SUMS>
 ```
+
+A URL without a dated serial directory, or naming `current` or `latest`, is
+refused, as is `--image-url` without `--sha256`. When the new image should
+be the default, change the release's `PIN_URL` and `PIN_SHA256` in the script
+(and the table above) in the same commit.
+
+20.04's standard support ended in May 2025; `release-20250624` is its last
+image, and the 20.04 archive still installs packages, but neither gets
+updates now.
 
 Then run the script, dry run first, then with `--apply`. The new base gets
 today's date in its name and the next free VMID pair. Prove it before any
@@ -607,6 +650,58 @@ Copy it to the replica node with
 Builds whose `BASE_PROXMOX` glob matches the new name use it from then on,
 since the newest match wins. Delete the old base (both copies) by hand once
 nothing needs it, as in "Deleting an old image".
+
+#### Building the Rocky Linux base: `proxmox_base_rocky.sh`
+
+`scripts/image_build/proxmox_base_rocky.sh` builds `base-rocky-9-<yyyymmdd>`,
+a RHEL-family base meeting the same contract, from the official Rocky Linux 9
+GenericCloud image. It runs on the same engine as `proxmox_base_ubuntu.sh`
+(`proxmox_base_lib.sh`): the same options except `--release`, the same keys,
+dry run, VMID rule, memory floor and marker-checked cleanup. Its image is
+pinned the same way, fails closed the same way, and is fetched the same way
+when absent:
+
+| Pinned image | SHA-256 |
+|---|---|
+| `https://dl.rockylinux.org/pub/rocky/9.9/images/x86_64/Rocky-9-GenericCloud-Base-9.9-20261112.0.x86_64.qcow2` (what `base-rocky-9-20261121` was built from) | `4f88f4209de50813d8054ab97309e7169a580206a0c4ea04f375d36c4846d50e` (Rocky's `.CHECKSUM` for it) |
+
+It is kept on the node under its own dated name in
+`/var/lib/vz/template/iso`. The moving `Rocky-9-GenericCloud-Base.latest`
+name is refused as an `--image-url`; another image is
+`--image-url .../Rocky-9-GenericCloud-Base-9.<minor>-<yyyymmdd>.<n>.x86_64.qcow2 --sha256 <hash from its .CHECKSUM>`.
+When Rocky 9.10 ships, Rocky moves the `9.9/` directory to
+`https://dl.rockylinux.org/vault/rocky/9.9/`: pass the vault URL with the
+same hash.
+
+What differs from the Ubuntu base:
+
+- **CPU type.** RHEL 9 is built for x86-64-v2. On `qm create`'s default CPU
+  (`kvm64`) its glibc stops init ("Fatal glibc error: CPU does not support
+  x86-64-v2") and the kernel panics, so no agent ever answers. The template
+  is created with `--cpu x86-64-v2-AES`; clones, and every image built on
+  it, inherit the type.
+- **guest-exec.** Rocky's `qemu-guest-agent` allows only a list of RPCs
+  (`FILTER_RPC_ARGS` in `/etc/sysconfig/qemu-ga`) that leaves `guest-exec`
+  out, and the builder injects its key, and this script runs its finalize,
+  through `guest-exec`. The first boot adds a second environment file
+  (`/etc/qemu-ga/image-build.env`, `FILTER_RPC_ARGS=--block-rpcs=`) through a
+  drop-in, so every RPC is allowed, as on Ubuntu, and makes the agent's
+  SELinux domain `virt_qemu_ga_t` permissive (`semanage permissive`), so what
+  it runs is not denied. SELinux stays enforcing for everything else.
+- **SSH.** `sshd.service` is enabled; `sshd-keygen@` units make the host keys
+  when it starts. `/home/builder/.ssh` exists, empty, mode 700 and labelled
+  `ssh_home_t`, so the key the builder writes there inherits a label sshd may
+  read.
+- **Network.** One NetworkManager profile (`image-build-dhcp`) matches
+  `en*` and `eth*` by name with `multi-connect=3`, so it brings up DHCP
+  (client ID from the MAC) on every interface at once; cloud-init's own
+  profile is removed.
+- **cloud-init** runs on the base's first boot only: the finalize cleans it
+  and writes `/etc/cloud/cloud-init.disabled`, since a clone has no
+  datasource.
+
+Prove and replicate it as for the Ubuntu base. `seal_linux.sh` handles it:
+see "Host SSH".
 
 #### Building the Windows base: `proxmox_base_windows.sh`
 

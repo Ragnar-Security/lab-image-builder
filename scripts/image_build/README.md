@@ -321,12 +321,32 @@ save shuts the build VM down, and Win32-OpenSSH 10.0 (the Server 2016 base)
 registers sshd with "restart on failure": sshd exits uncleanly at the
 shutdown, the service manager restarts it, and it writes new keys into the
 image (measured on pve2: two clones of such an image shared them). So the
-seal also writes `C:\ProgramData\ssh\first-boot-host-keys.ps1`, registers a
-startup task `image-build-ssh-host-keys` that runs it as SYSTEM, and leaves
-sshd `Manual`. On a clone's first boot the task deletes whatever host keys
-the image holds, sets sshd `Automatic` and starts it, so sshd writes the
-clone's own keys, and then removes the task and the script. If sshd writes
-no key, both stay and the next boot tries again.
+seal also leaves sshd `Manual` and installs a first-boot step that runs as
+SYSTEM:
+
+- **What SYSTEM runs, only administrators can change.** The script is
+  `C:\ProgramData\image-build-first-boot\first-boot-host-keys.ps1`. The
+  directory and the script are owned by Administrators with a protected DACL
+  (SYSTEM and Administrators full control, nothing inherited, no one else).
+  The startup task `image-build-ssh-host-keys` runs it as SYSTEM, highest
+  privileges, and its security descriptor is set to SYSTEM and Administrators
+  only. The seal reads all of it back and fails if any other principal holds a
+  write right: on the directory, the script, the task (through the Task
+  Scheduler API) and the task's file under `System32\Tasks`, plus the right to
+  delete a child of the directory's parent. The check reads each security
+  descriptor with generic rights mapped and does not subtract deny ACEs, so
+  it is stricter than Windows' effective access: it can refuse a grant that a
+  deny cancels, never pass one that holds.
+- **Keys first, sshd second.** On a clone's first boot the script records the
+  fingerprints of whatever keys the image holds, deletes them, runs
+  `ssh-keygen -A` with sshd stopped, and checks that an RSA, ECDSA and Ed25519
+  pair exist and differ from the image's. Only then does it set sshd
+  `Automatic`, start it, unregister the task and delete itself (in that
+  order, so a task never outlives its script). On any failure sshd stays
+  `Manual` and stopped, the failure goes to `first-boot.log` beside the
+  script, and the task runs again at the next boot, up to 5 attempts. Once
+  keys have been made they are never deleted again: a later run only starts
+  sshd and cleans up.
 
 ## Windows recipes
 

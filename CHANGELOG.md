@@ -111,12 +111,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   image presented the same host key, and every clone of any Windows image
   carried the same private host keys on disk. `seal_windows.ps1` now deletes
   `C:\ProgramData\ssh\ssh_host_*` in both modes and fails if one survives.
-  With `-KeepSsh` it also leaves sshd `Manual` and registers a startup task
-  that, on a clone's first boot, deletes the image's keys, starts sshd (which
-  writes the clone's own) and removes itself: on Server 2016 the service
-  manager restarts sshd during the save's shutdown, which writes new keys
-  into the image after the seal. `seal_linux.sh` already deleted the keys in
-  both modes.
+  With `-KeepSsh` it also leaves sshd `Manual` and registers a SYSTEM
+  startup task: on Server 2016 the service manager restarts sshd during the
+  save's shutdown, which writes new keys into the image after the seal. On a
+  clone's first boot the task makes the clone's own keys with `ssh-keygen -A`,
+  checks they exist and differ from the image's, and only then sets sshd
+  `Automatic` and starts it; on failure sshd stays `Manual` and stopped and
+  the task retries at the next boot (5 attempts). The task's script and
+  directory, the task and its file are administrators-only, and the seal
+  reads that back and fails otherwise. `seal_linux.sh` already deleted the
+  keys in both modes.
 
 - A build stopped by SIGTERM no longer leaves its build VM running when the
   signal also killed the reader of the builder's stderr (a `tee` into a log)

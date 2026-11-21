@@ -636,83 +636,338 @@ def test_seal_windows_deletes_host_keys_with_and_without_keep_ssh():
 # restarts it, and sshd writes new host keys into the image (measured on pve2:
 # two clones of a -KeepSsh seal of a base-ws2016 clone shared keys written at
 # the shutdown). So the seal also leaves sshd Manual and registers a startup
-# task, and the clone's first boot deletes whatever keys the image holds before
-# it starts sshd, which then writes its own.
+# task that runs a script as SYSTEM on the clone's first boot.
 
-def _first_boot(tmp_path: Path, ssh: Path, start_writes_keys: bool):
-    """Run the first-boot script the seal writes, with sshd, Set-Service and
-    Unregister-ScheduledTask replaced by recording functions. The fake
-    Start-Service writes new keys when `start_writes_keys`, as sshd does. The
-    script runs in its own script scope, so the record is global."""
-    write = "\n".join(f"Set-Content -LiteralPath '{ssh / n}' -Value 'new {n}'" for n in HOST_KEYS)
-    body = (
-        "$global:log = @()\n"
-        "function New-ScheduledTaskAction { param($Execute, $Argument) }\n"
-        "function New-ScheduledTaskTrigger { param([switch]$AtStartup) }\n"
-        "function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) }\n"
-        "function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, [switch]$Force) }\n"
-        "function Set-Service { param($Name, $StartupType) $global:log += \"set $Name $StartupType\" }\n"
-        "function Start-Service { param($Name) $global:log += \"start $Name keys=$(@(Get-ChildItem "
-        f"'{ssh}\\ssh_host_*').Count)\"\n" + (write + "\n" if start_writes_keys else "") + "}\n"
-        "function Unregister-ScheduledTask { param($TaskName, $Confirm) $global:log += \"unregister $TaskName\" }\n"
-        # Every command that would touch this host is shadowed before the seal's function runs.
-        f"Register-SshHostKeyFirstBoot -Directory '{ssh}' -TaskName 'image-build-ssh-host-keys'\n"
-        "$global:log = @()\n"
-        f"try {{ & '{ssh / 'first-boot-host-keys.ps1'}'; 'first boot: ok' }} catch {{ \"first boot: $($_.Exception.Message)\" }}\n"
-        "$global:log | ForEach-Object { \"log: $_\" }\n")
-    return _seal_windows(tmp_path, body)
+# --- the first-boot script: the clone's own keys first, only then sshd on ----
 
+FIRST_BOOT_MOCKS = r"""
+$global:log = @(); $global:sshdStatus = 'Stopped'; $global:startType = 'Manual'
+function global:Get-Service { param($Name) [pscustomobject]@{ Status = $global:sshdStatus } }
+function global:Set-Service { param($Name, $StartupType) $global:startType = $StartupType; $global:log += "set $Name $StartupType" }
+function global:Stop-Service { param($Name, [switch]$Force) $global:sshdStatus = 'Stopped'; $global:log += "stop $Name" }
+function global:Start-Service { param($Name)
+    if ($global:startFails) { $global:log += "start $Name failed"; throw 'the service did not start' }
+    $global:sshdStatus = 'Running'
+    $global:log += "start $Name type=$global:startType keys=$(@(Get-ChildItem '__SSH__\ssh_host_*').Count)" }
+function global:Unregister-ScheduledTask { param($TaskName, $Confirm)
+    if ($global:unregisterFails) { throw 'access denied' }
+    $global:log += "unregister $TaskName" }
+"""
 
-def test_seal_windows_first_boot_replaces_the_image_host_keys(tmp_path):
-    ssh = _ssh_dir(tmp_path)
-    result, out = _first_boot(tmp_path, ssh, start_writes_keys=True)
-    assert result.returncode == 0, out
-    assert "first boot: ok" in out, out
-    # The image's keys are gone before sshd starts, and sshd's own are left.
-    assert [l for l in out.splitlines() if l.startswith("log: ")] == [
-        "log: set sshd Automatic", "log: start sshd keys=0", "log: unregister image-build-ssh-host-keys"], out
-    assert all((ssh / n).read_text().strip() == f"new {n}" for n in HOST_KEYS), out
-    assert (ssh / "sshd_config").is_file()
-    # The step removes itself: the script file and (above) the task.
-    assert not (ssh / "first-boot-host-keys.ps1").exists(), out
+# ssh-keygen -A as the clone runs it, played by a script: 'ok' writes three new
+# key pairs, 'fail' writes nothing and exits 1, 'image' writes the image's keys
+# back, 'partial' writes only an Ed25519 pair.
+FAKE_KEYGEN = r"""
+$ssh = '__SSH__'
+$global:log += "keygen -A sshd=$global:sshdStatus keys=$(@(Get-ChildItem "$ssh\ssh_host_*").Count)"
+if ($global:keygenMode -eq 'fail') { [Console]::Error.WriteLine('ssh-keygen: failed'); exit 1 }
+if ($global:keygenMode -eq 'image') { Copy-Item '__IMAGE__\*' $ssh; exit 0 }
+$types = if ($global:keygenMode -eq 'partial') { @('ed25519') } else { @('rsa', 'ecdsa', 'ed25519') }
+foreach ($t in $types) {
+    $b = New-Object byte[] 51; (New-Object Random).NextBytes($b)
+    Set-Content "$ssh\ssh_host_${t}_key" 'private'
+    Set-Content "$ssh\ssh_host_${t}_key.pub" "ssh-$t $([Convert]::ToBase64String($b)) system@clone"
+}
+exit 0
+"""
 
 
-def test_seal_windows_first_boot_keeps_its_task_when_sshd_writes_no_key(tmp_path):
-    # sshd started but wrote no host key: the step fails and stays registered,
-    # so the next boot tries again.
-    ssh = _ssh_dir(tmp_path)
-    result, out = _first_boot(tmp_path, ssh, start_writes_keys=False)
-    assert result.returncode == 0, out
-    assert "first boot: sshd wrote no host key" in out, out
-    assert "log: unregister" not in out, out
-    assert (ssh / "first-boot-host-keys.ps1").is_file(), out
+def _pub_blob() -> str:
+    return __import__("base64").b64encode(os.urandom(51)).decode()
 
 
-def test_seal_windows_registers_the_first_boot_step(tmp_path):
+def _image_keys(tmp_path: Path) -> Path:
+    """C:\\ProgramData\\ssh as a clone of the image finds it: the keys sshd wrote
+    when the service manager restarted it at the save's shutdown."""
     ssh = tmp_path / "ssh"
-    ssh.mkdir()
-    body = (
-        "$global:log = @()\n"
-        "function New-ScheduledTaskAction { param($Execute, $Argument) \"action $Execute $Argument\" }\n"
-        "function New-ScheduledTaskTrigger { param([switch]$AtStartup) \"trigger AtStartup=$AtStartup\" }\n"
-        "function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) \"principal $UserId $LogonType $RunLevel\" }\n"
-        "function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, [switch]$Force)\n"
-        "  $global:log += \"register $TaskName | $Action | $Trigger | $Principal | Force=$Force\" }\n"
-        "function Set-Service { param($Name, $StartupType) $global:log += \"set $Name $StartupType\" }\n"
-        f"Register-SshHostKeyFirstBoot -Directory '{ssh}' -TaskName 'image-build-ssh-host-keys'\n"
-        "$global:log | ForEach-Object { \"log: $_\" }\n")
-    result, out = _seal_windows(tmp_path, body)
+    image = tmp_path / "image-copy"
+    ssh.mkdir(parents=True)
+    image.mkdir()
+    for t in ("rsa", "ecdsa", "ed25519"):
+        for d in (ssh, image):
+            (d / f"ssh_host_{t}_key").write_text("image private\n")
+        blob = _pub_blob()
+        for d in (ssh, image):
+            (d / f"ssh_host_{t}_key.pub").write_text(f"ssh-{t} {blob} system@image\n")
+    (ssh / "sshd_config").write_text("Match Group administrators\n")
+    return ssh
+
+
+def _fingerprints(ssh: Path) -> dict:
+    out = {}
+    for pub in sorted(ssh.glob("ssh_host_*_key.pub")):
+        blob = __import__("base64").b64decode(pub.read_text().split()[1])
+        out[pub.name] = "SHA256:" + __import__("base64").b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+    return out
+
+
+def _first_boot(tmp_path: Path, runs: list):
+    """Write the first-boot script the seal would write, then run it once per
+    entry of `runs` (each sets keygen, startFails, unregisterFails; `rewrite`
+    puts the script back first, as if the task fired again after it had
+    removed both), with
+    sshd, the service cmdlets and Unregister-ScheduledTask played by recording
+    functions. The script runs in its own scope, so the record is global."""
+    ssh = tmp_path / "ssh"
+    fb = tmp_path / "first-boot"
+    fb.mkdir()
+    keygen = tmp_path / "ssh-keygen.ps1"
+    keygen.write_text(FAKE_KEYGEN.replace("__SSH__", str(ssh)).replace("__IMAGE__", str(tmp_path / "image-copy")),
+                      encoding="utf-8")
+    script = fb / "first-boot-host-keys.ps1"
+    body = FIRST_BOOT_MOCKS.replace("__SSH__", str(ssh)) + (
+        f"$text = Get-FirstBootScript -SshDirectory '{ssh}' -Directory '{fb}' "
+        f"-TaskName 'image-build-ssh-host-keys' -Keygen '{keygen}'\n"
+        f"Set-Content -LiteralPath '{script}' -Value $text -Encoding UTF8\n")
+    for i, run in enumerate(runs, 1):
+        body += (
+            (f"Set-Content -LiteralPath '{script}' -Value $text -Encoding UTF8\n" if run.get("rewrite") else "") +
+            f"$global:keygenMode = '{run.get('keygen', 'ok')}'; $global:startFails = ${bool(run.get('start_fails'))}; "
+            f"$global:unregisterFails = ${bool(run.get('unregister_fails'))}\n"
+            f"$global:log += '-- run {i}'; $global:LASTEXITCODE = 0\n"
+            f"& '{script}'\n"
+            f"$global:log += \"exit $LASTEXITCODE; sshd $global:sshdStatus $global:startType; "
+            f"script $(Test-Path '{script}')\"\n")
+    body += "$global:log | ForEach-Object { \"log: $_\" }\n"
+    result, out = _seal_windows(tmp_path / "harness", body)
+    log = [l[len("log: "):] for l in out.splitlines() if l.startswith("log: ")]
+    return result, out, log, fb
+
+
+def test_first_boot_makes_the_keys_before_it_turns_sshd_on(tmp_path):
+    ssh = _image_keys(tmp_path)
+    image = _fingerprints(ssh)
+    result, out, log, fb = _first_boot(tmp_path, [{}])
     assert result.returncode == 0, out
-    script = ssh / "first-boot-host-keys.ps1"
-    assert script.is_file(), out
+    assert log == [
+        "-- run 1",
+        "set sshd Manual",                        # held off while the keys change
+        "keygen -A sshd=Stopped keys=0",          # the image's keys are gone first
+        "set sshd Automatic",                     # only after the new keys checked out
+        "start sshd type=Automatic keys=6",
+        "unregister image-build-ssh-host-keys",
+        "exit 0; sshd Running Automatic; script False",
+    ], out
+    new = _fingerprints(ssh)
+    assert sorted(new) == sorted(image) and not set(new.values()) & set(image.values()), (new, image)
+    assert sorted((fb / "image-fingerprints").read_text().split()) == sorted(image.values())
+    assert sorted((fb / "keys-generated").read_text().split()) == sorted(new.values())
+    assert "attempt 1: new host keys" in (fb / "first-boot.log").read_text()
+
+
+@pytest.mark.parametrize("mode,why", [
+    ("fail", "ssh-keygen -A exited 1"),
+    ("partial", "ssh-keygen -A wrote no rsa key"),
+    ("image", "the new rsa key is the image's"),
+])
+def test_first_boot_leaves_sshd_off_when_key_generation_fails(tmp_path, mode, why):
+    _image_keys(tmp_path)
+    result, out, log, fb = _first_boot(tmp_path, [{"keygen": mode}])
+    assert result.returncode == 0, out
+    # sshd never set Automatic and never started; the task and script stay.
+    assert log == ["-- run 1", "set sshd Manual", log[2], "set sshd Manual",
+                   "exit 1; sshd Stopped Manual; script True"], out
+    assert log[2].startswith("keygen -A sshd=Stopped"), out
+    assert why in (fb / "first-boot.log").read_text(), (fb / "first-boot.log").read_text()
+    assert not (fb / "keys-generated").exists()
+
+
+def test_first_boot_after_success_never_touches_the_keys_again(tmp_path):
+    # Run 1 makes the keys but sshd fails to start: sshd is left Manual and
+    # stopped and the task stays. Run 2 (next boot) only starts sshd. Run 3
+    # (the task fired again although it had succeeded) changes nothing.
+    _image_keys(tmp_path)
+    result, out, log, fb = _first_boot(tmp_path, [{"start_fails": True}, {}, {"rewrite": True}])
+    assert result.returncode == 0, out
+    assert log == [
+        "-- run 1", "set sshd Manual", "keygen -A sshd=Stopped keys=0", "set sshd Automatic",
+        "start sshd failed", "set sshd Manual", "exit 1; sshd Stopped Manual; script True",
+        "-- run 2", "set sshd Automatic", "start sshd type=Automatic keys=6",
+        "unregister image-build-ssh-host-keys", "exit 0; sshd Running Automatic; script False",
+        "-- run 3", "set sshd Automatic", "start sshd type=Automatic keys=6",
+        "unregister image-build-ssh-host-keys", "exit 0; sshd Running Automatic; script False",
+    ], out
+    made = (fb / "keys-generated").read_text().split()
+    assert sorted(_fingerprints(tmp_path / "ssh").values()) == sorted(made)
+    text = (fb / "first-boot.log").read_text()
+    assert "attempt 2: keys were made on an earlier attempt; not touched" in text, text
+    assert "attempt 3: keys were made on an earlier attempt; not touched" in text, text
+
+
+def test_first_boot_keeps_its_script_until_the_task_is_gone(tmp_path):
+    # The task cannot be unregistered: the script stays, so the task's next
+    # run (next boot) still has something to run, and finishes the job. The
+    # other order would leave a task with no script, and sshd off for good.
+    _image_keys(tmp_path)
+    result, out, log, fb = _first_boot(tmp_path, [{"unregister_fails": True}, {}])
+    assert result.returncode == 0, out
+    assert log[-9:] == [
+        "start sshd type=Automatic keys=6", "set sshd Manual", "stop sshd",
+        "exit 1; sshd Stopped Manual; script True",
+        "-- run 2", "set sshd Automatic", "start sshd type=Automatic keys=6",
+        "unregister image-build-ssh-host-keys", "exit 0; sshd Running Automatic; script False",
+    ], out
+
+
+def test_first_boot_gives_up_after_five_attempts(tmp_path):
+    _image_keys(tmp_path)
+    result, out, log, fb = _first_boot(tmp_path, [{"keygen": "fail"}] * 6)
+    assert result.returncode == 0, out
+    assert log.count("exit 1; sshd Stopped Manual; script True") == 5, out
+    assert sum(1 for l in log if l.startswith("keygen")) == 5, out
+    assert log[-4:] == ["-- run 6", "set sshd Manual", "unregister image-build-ssh-host-keys",
+                        "exit 1; sshd Stopped Manual; script False"], out
+    assert "giving up after 5 attempts" in (fb / "first-boot.log").read_text()
+
+
+# --- who may change what SYSTEM runs ------------------------------------------
+# Every check reads the security descriptor back and judges it with
+# Get-NonAdminWriteAccess: generic rights mapped, inherit-only ACEs counted on
+# the object itself, deny ACEs NOT subtracted (stricter than Windows' effective
+# access, so a write grant is never missed).
+
+PROGRAMDATA_SDDL = ("O:SYG:SYD:PAI(A;OICIIO;GA;;;CO)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+                    "(A;CI;DCLCRPCR;;;BU)")   # read on Server 2016 and 2022 (pve2, 2026-11-21)
+
+
+@pytest.mark.parametrize("sddl,args,want", [
+    ("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)", "", []),
+    ("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)", "", []),                  # Users read/execute
+    ("O:BAD:P(A;;FA;;;SY)(A;;0x1301bf;;;AU)", "", ["S-1-5-11 has 0x00010116"]),      # Modify
+    ("O:BAD:P(A;;GA;;;WD)", "", ["S-1-1-0 has 0x10000000"]),                         # generic all
+    ("O:BAD:P(A;;GW;;;BU)", "", ["S-1-5-32-545 has 0x40000000"]),                    # generic write
+    ("O:BAD:P(A;;WD;;;AU)(D;;WD;;;AU)", "", ["S-1-5-11 has 0x00040000"]),            # a deny does not excuse
+    ("O:BAD:P(A;OICIIO;GA;;;CO)", "", ["S-1-3-0 has 0x10000000"]),                   # inherit-only counts
+    ("O:BUD:P(A;;FA;;;SY)", "", ["owner S-1-5-32-545"]),
+    ("O:BAD:", "", []),                                                              # empty DACL: no one
+    ("O:BA", "", ["no DACL"]),                                                       # null DACL: everyone
+    (PROGRAMDATA_SDDL, "-Mask $ParentMask -EffectiveOnly", []),                      # Users cannot delete a child
+    (PROGRAMDATA_SDDL, "", ["S-1-3-0 has 0x10000000", "S-1-5-32-545 has 0x00000116"]),
+])
+def test_non_admin_write_access(tmp_path, sddl, args, want):
+    result, out = _seal_windows(tmp_path, f"Get-NonAdminWriteAccess -Sddl '{sddl}' -Label x {args} | "
+                                          "ForEach-Object { \"finding: $_\" }\n'end'\n")
+    assert result.returncode == 0 and "end" in out, out
+    assert [l[len("finding: x: "):] for l in out.splitlines() if l.startswith("finding: ")] == want, out
+
+
+def _me() -> str:
+    out = subprocess.run(_powershell() + ["-Command", "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value"],
+                         capture_output=True, text=True, timeout=60)
+    return out.stdout.strip()
+
+
+TASK_MOCKS = r"""
+function New-ScheduledTaskAction { param($Execute, $Argument) [pscustomobject]@{ Execute = $Execute; Arguments = $Argument } }
+function New-ScheduledTaskTrigger { param([switch]$AtStartup) "AtStartup=$AtStartup" }
+function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) [pscustomobject]@{ UserId = 'SYSTEM'; RunLevel = $RunLevel } }
+$global:registered = $null
+function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, [switch]$Force)
+    $global:registered = [pscustomobject]@{ Actions = @($Action); Principal = $Principal }
+    # Its output goes to Out-Null, so the record goes straight to stdout.
+    [Console]::Out.WriteLine("log: register $TaskName | $($Action.Execute) $($Action.Arguments) | $Trigger | $($Principal.UserId) $($Principal.RunLevel) | Force=$Force") }
+function Get-ScheduledTask { param($TaskName) $global:registered }
+function Set-TaskSddl { param($TaskName, $Sddl) "log: task sddl $Sddl" }
+function Get-TaskSddl { param($TaskName) '__TASK_SDDL__' }
+function Set-Service { param($Name, $StartupType) "log: set $Name $StartupType" }
+"""
+
+
+def _register(tmp_path: Path, extra: str = "", task_sddl: str = "O:BAD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;SY)",
+              broad_parent: bool = False):
+    """Register-SshHostKeyFirstBoot against real NTFS under tmp_path, with the
+    Task Scheduler played by functions. This test does not run elevated, so its
+    own SID stands in for Administrators (owner and the second full-control
+    ACE). The parent directory gets C:\\ProgramData's ACL as Server 2016 and 2022
+    ship it (this user for Administrators); `broad_parent` adds an inheritable
+    Authenticated Users Modify ACE to it, as a base with a broad C:\\ProgramData
+    would. `extra` runs afterwards."""
+    me = _me()
+    root = tmp_path / "programdata"
+    root.mkdir(parents=True)
+    task_file = tmp_path / "tasks" / "image-build-ssh-host-keys"
+    task_file.parent.mkdir()
+    task_file.write_text("<Task/>")
+    trusted = f"@($AdminSids + '{me}')"
+    body = TASK_MOCKS.replace("__TASK_SDDL__", task_sddl) + (
+        f"$a = Get-Acl '{root}'; $a.SetSecurityDescriptorSddlForm('O:{me}D:PAI(A;OICIIO;GA;;;CO)(A;OICI;FA;;;SY)"
+        f"(A;OICI;FA;;;{me})(A;OICI;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)', 'Owner, Access'); Set-Acl '{root}' $a\n" +
+        (f"icacls '{root}' /grant '*S-1-5-11:(OI)(CI)(M)' | Out-Null\n" if broad_parent else "") +
+        # C:\\Windows\\System32\\Tasks and the task's file there: administrators only.
+        f"Protect-AdminOnlyPath -Path '{task_file}' -AdminSid '{me}'\n"
+        f"Protect-AdminOnlyPath -Path '{task_file.parent}' -AdminSid '{me}'\n"
+        "try {\n"
+        f"  Register-SshHostKeyFirstBoot -SshDirectory 'C:\\ProgramData\\ssh' -Directory '{root}\\image-build-first-boot' "
+        f"-TaskName 'image-build-ssh-host-keys' -Keygen 'C:\\OpenSSH\\ssh-keygen.exe' -AdminSid '{me}' -Trusted {trusted} "
+        f"-TaskFile '{task_file}'\n"
+        "  'registered'\n"
+        "} catch { \"failed: $($_.Exception.Message)\" }\n"
+        f"foreach ($p in '{root}\\image-build-first-boot', '{root}\\image-build-first-boot\\first-boot-host-keys.ps1') {{\n"
+        "  if (Test-Path $p) { \"sddl: $((Get-Acl $p).Sddl)\" } }\n" + extra)
+    try:
+        result, out = _seal_windows(tmp_path / "harness", body)
+    finally:
+        # Hand the tree back to this user so pytest can delete it.
+        subprocess.run(["icacls", str(tmp_path), "/reset", "/T", "/C", "/Q"], capture_output=True, timeout=120)
+    return result, out, me, root
+
+
+def test_first_boot_script_and_directory_are_administrators_only(tmp_path):
+    result, out, me, root = _register(tmp_path)
+    assert result.returncode == 0, out
+    assert "registered" in out, out
+    script = root / "image-build-first-boot" / "first-boot-host-keys.ps1"
     log = [l[len("log: "):] for l in out.splitlines() if l.startswith("log: ")]
     assert log == [
-        "register image-build-ssh-host-keys | action powershell.exe -NoProfile -NonInteractive "
-        f"-ExecutionPolicy Bypass -File \"{script}\" | trigger AtStartup=True | "
-        "principal NT AUTHORITY\\SYSTEM ServiceAccount Highest | Force=True",
-        # Registered first: sshd is left Manual only once the step that starts it exists.
-        "set sshd Manual",
+        f"register image-build-ssh-host-keys | powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+        f"-File \"{script}\" | AtStartup=True | SYSTEM Highest | Force=True",
+        "task sddl D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+        "set sshd Manual",   # only once the task that turns it on is in place and checked
     ], out
+    # Read back: owner Administrators (here this user), protected (P), only
+    # SYSTEM and Administrators; the directory's ACEs inherited by what it holds.
+    sddl = [l[len("sddl: "):] for l in out.splitlines() if l.startswith("sddl: ")]
+    assert [(x.split("G:")[0], x.split("D:")[1]) for x in sddl] == [
+        (f"O:{me}", f"PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;{me})"),
+        (f"O:{me}", f"PAI(A;;FA;;;SY)(A;;FA;;;{me})"),
+    ], out
+
+
+def test_first_boot_directory_drops_a_broad_parent_acl(tmp_path):
+    # A base whose C:\ProgramData lets Authenticated Users modify everything
+    # below it: the directory is protected, so nothing of that is inherited.
+    result, out, me, root = _register(tmp_path, broad_parent=True)
+    assert result.returncode == 0, out
+    assert "registered" in out, out
+    assert all("S-1-5-11" not in l and ";AU)" not in l for l in out.splitlines() if l.startswith("sddl: ")), out
+
+
+@pytest.mark.parametrize("target", ["image-build-first-boot\\first-boot-host-keys.ps1", "image-build-first-boot"])
+def test_first_boot_check_fails_on_an_authenticated_users_modify_ace(tmp_path, target):
+    # The seal's own check, run again after an Authenticated Users Modify ACE
+    # is added to the script or to its directory, must fail.
+    extra = (
+        "$t = Join-Path (Split-Path (Get-ChildItem -Recurse -Filter first-boot-host-keys.ps1 '__ROOT__')[0].DirectoryName) '__TARGET__'\n"
+        "$grant = if ((Get-Item $t).PSIsContainer) { '*S-1-5-11:(OI)(CI)(M)' } else { '*S-1-5-11:(M)' }\n"
+        "icacls $t /grant $grant | Out-Null\n"
+        "try { Assert-AdminOnlyPath -Path $t -Trusted @($AdminSids + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value); 'still passes' }\n"
+        "catch { \"check: $($_.Exception.Message)\" }\n")
+    root = tmp_path / "programdata"
+    result, out, me, root = _register(tmp_path, extra.replace("__ROOT__", str(root)).replace("__TARGET__", target))
+    assert result.returncode == 0, out
+    assert "registered" in out and "still passes" not in out, out
+    assert "check: not administrators only:" in out and "S-1-5-11 has 0x00010116" in out, out
+
+
+@pytest.mark.parametrize("task_sddl,why", [
+    ("O:BAD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1f019f;;;AU)", "task image-build-ssh-host-keys: S-1-5-11 has"),
+    ("O:BUD:(A;;FA;;;SY)(A;;FA;;;BA)", "task image-build-ssh-host-keys: owner S-1-5-32-545"),
+])
+def test_register_fails_when_others_can_change_the_task(tmp_path, task_sddl, why):
+    result, out, me, root = _register(tmp_path, task_sddl=task_sddl)
+    assert result.returncode == 0, out
+    assert "failed: not administrators only:" in out and why in out, out
+    assert "log: set sshd Manual" not in out, out   # the seal stops before it touches sshd
 
 
 def test_seal_windows_registers_the_first_boot_step_only_with_keep_ssh():
@@ -733,7 +988,8 @@ def test_seal_windows_registers_the_first_boot_step_only_with_keep_ssh():
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     assert [l for l in out.splitlines() if l.startswith("call: ")] == [
-        "call: Register-SshHostKeyFirstBoot -Directory 'C:\\ProgramData\\ssh' -TaskName 'image-build-ssh-host-keys'"
+        "call: Register-SshHostKeyFirstBoot -SshDirectory 'C:\\ProgramData\\ssh' "
+        "-Directory 'C:\\ProgramData\\image-build-first-boot' -TaskName 'image-build-ssh-host-keys' -Keygen $keygen"
         " | if $KeepSsh",
         "call: Set-Service sshd -StartupType Disabled | else of $KeepSsh",
     ], out

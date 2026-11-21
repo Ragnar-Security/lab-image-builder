@@ -23,11 +23,24 @@ Step 'apps installed for a user but not provisioned (sysprep refuses them, 0x800
 # The cumulative update installs Microsoft Edge (Microsoft.MicrosoftEdge.Stable)
 # for Administrator only; sysprep /generalize then fails. Remove every such
 # package that Windows allows to be removed.
+# Windows Server 2016 (14393) has neither the packages' NonRemovable property
+# nor Remove-AppxPackage -AllUsers. Its system apps (C:\Windows\SystemApps,
+# signature kind System) are part of Windows and do not stop sysprep; there,
+# they are left alone, and any other stray package fails this step by name.
+$sample = Get-AppxPackage -AllUsers | Select-Object -First 1
+$hasNonRemovable = [bool]($sample -and $sample.PSObject.Properties['NonRemovable'])
 $provisioned = @(Get-AppxProvisionedPackage -Online | ForEach-Object { $_.DisplayName })
 $stray = @(Get-AppxPackage -AllUsers | Where-Object {
-    -not $_.IsFramework -and -not $_.NonRemovable -and $provisioned -notcontains $_.Name -and
+    $removable = if ($hasNonRemovable) { -not $_.NonRemovable } else {
+        $_.SignatureKind -ne 'System' -and -not "$($_.InstallLocation)".StartsWith($env:windir, [StringComparison]::OrdinalIgnoreCase)
+    }
+    -not $_.IsFramework -and $removable -and $provisioned -notcontains $_.Name -and
     ($_.PackageUserInformation | Where-Object { $_.InstallState -eq 'Installed' })
 })
+$allUsers = (Get-Command Remove-AppxPackage).Parameters.ContainsKey('AllUsers')
+if ($stray.Count -and -not $allUsers) {
+    throw "Remove-AppxPackage has no -AllUsers here; remove by hand: $($stray.PackageFullName -join ', ')"
+}
 foreach ($p in $stray) {
     Write-Output "removing $($p.PackageFullName)"
     Remove-AppxPackage -Package $p.PackageFullName -AllUsers

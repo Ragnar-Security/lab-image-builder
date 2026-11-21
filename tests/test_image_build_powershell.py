@@ -177,6 +177,41 @@ def test_expand_payload_refuses_a_damaged_archive(tmp_path):
     assert result.returncode != 0 and "ends early" in result.stdout + result.stderr, result.stdout + result.stderr
 
 
+def _damaged_gzip(raw: bytes, how: str) -> bytes:
+    data = bytearray(raw)
+    if how == "truncated-tail":     # the trailer cut off
+        return bytes(data[:-6])
+    if how == "truncated-half":     # cut inside the compressed data
+        return bytes(data[:len(data) // 2])
+    if how == "crc-byte":           # one bit of the trailer's CRC-32
+        data[-7] ^= 0x01
+    elif how == "isize-byte":       # one bit of the trailer's length
+        data[-2] ^= 0x01
+    elif how == "body-byte":        # one bit in the middle of the compressed data
+        data[len(data) // 2] ^= 0x01
+    return bytes(data)
+
+
+@pytest.mark.parametrize("how", ["truncated-tail", "truncated-half", "crc-byte", "isize-byte", "body-byte"])
+def test_expand_payload_refuses_a_damaged_gzip_stream_and_writes_nothing(tmp_path, how):
+    # The tar stream inside is intact up to its end-of-archive blocks; only the
+    # gzip layer is damaged. Nothing may be extracted.
+    src = tmp_path / "payload"
+    _payload_tree(src)
+    good = tmp_path / "good.tgz"
+    _python_tgz(src, good, tarfile.GNU_FORMAT)
+    bad = tmp_path / "bad.tgz"
+    bad.write_bytes(_damaged_gzip(good.read_bytes(), how))
+    dest = tmp_path / "out"
+    result = _expand(bad, dest)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "is not an intact gzip archive" in out, out
+    assert list(dest.iterdir()) == [], out
+    # The intact archive still extracts.
+    assert _expand(good, tmp_path / "ok").returncode == 0
+
+
 # --- install-openssh.ps1 (Windows Server 2016) -------------------------------------
 
 
@@ -268,3 +303,162 @@ def test_openssh_pin_matches_the_published_release(tmp_path):
                             capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "matches the pin" in result.stdout, result.stdout
+
+
+# --- finalize.ps1 (the Windows base's last step before sysprep) -------------------
+# Its app cleanup and its sshd stop run against stand-in cmdlets: functions of
+# the same names, which PowerShell resolves before the real cmdlets. The script
+# is dot-sourced with -FunctionsOnly, which returns before any step runs; the
+# guard below refuses to load a finalize.ps1 that would run its steps here.
+
+FINALIZE = IMAGE_BUILD / "windows_base" / "finalize.ps1"
+
+
+def _finalize(tmp_path: Path, body: str):
+    text = FINALIZE.read_text()
+    guard = text.find("if ($FunctionsOnly) { return }")
+    assert "param([switch]$FunctionsOnly)" in text and 0 < guard < text.find("\nStep '"), \
+        "finalize.ps1 must return under -FunctionsOnly before its first step"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    script = tmp_path / "harness.ps1"
+    script.write_text("$ErrorActionPreference = 'Stop'\n"
+                      f". '{FINALIZE}' -FunctionsOnly\n" + body, encoding="utf-8")
+    return subprocess.run(_powershell() + ["-File", str(script)], capture_output=True, text=True, timeout=120)
+
+
+# Package objects as Get-AppxPackage -AllUsers returns them. Server 2016's have
+# no NonRemovable property; Server 2019's and 2022's do.
+APPX = r'''
+function Pkg($name, $sig, $loc, [bool]$framework, $nonRemovable) {
+    $p = [ordered]@{ Name = $name; PackageFullName = "${name}_1.0_neutral__x"; SignatureKind = $sig
+        InstallLocation = $loc; IsFramework = $framework
+        PackageUserInformation = @([pscustomobject]@{ InstallState = 'Installed' }) }
+    if ($null -ne $nonRemovable) { $p.NonRemovable = [bool]$nonRemovable }
+    [pscustomobject]$p
+}
+$sys = "$env:windir\SystemApps\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy"
+$store = 'C:\Program Files\WindowsApps\Example.App_1.0_x64__x'
+$script:removed = @()
+'''
+# Advanced functions, so an unknown parameter (-AllUsers on 2016) fails as the cmdlet does.
+REMOVE_2016 = "function Remove-AppxPackage { [CmdletBinding()] param([string]$Package) $script:removed += $Package }\n"
+REMOVE_2022 = ("function Remove-AppxPackage { [CmdletBinding()] param([string]$Package, [switch]$AllUsers)\n"
+               "    $script:removed += \"$Package allusers=$AllUsers\" }\n")
+
+
+def test_finalize_leaves_server_2016_system_apps_alone(tmp_path):
+    # Measured on the first ws2016 base build: Microsoft.AAD.BrokerPlugin was
+    # taken for a stray package, and Remove-AppxPackage -AllUsers failed.
+    result = _finalize(tmp_path, APPX + REMOVE_2016 + r'''
+$pkgs = @(
+    (Pkg 'Microsoft.AAD.BrokerPlugin' 'System' $sys $false $null),
+    (Pkg 'Microsoft.Windows.ShellExperienceHost' 'Developer' "$env:windir\SystemApps\ShellExperienceHost_cw5n1h2txyewy" $false $null),
+    (Pkg 'Microsoft.VCLibs.140.00' 'Store' $store $true $null),
+    (Pkg 'Microsoft.Provisioned' 'Store' $store $false $null))
+$stray = Get-StrayAppxPackage -Packages $pkgs -ProvisionedNames @('Microsoft.Provisioned')
+"stray: $(@($stray).Count)"
+Remove-StrayAppxPackage -Stray $stray
+"removed: $($script:removed.Count)"
+''')
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "stray: 0" in out and "0 package(s) removed" in out and "removed: 0" in out, out
+
+
+def test_finalize_refuses_a_server_2016_stray_package_by_name(tmp_path):
+    result = _finalize(tmp_path, APPX + REMOVE_2016 + r'''
+$pkgs = @((Pkg 'Microsoft.AAD.BrokerPlugin' 'System' $sys $false $null), (Pkg 'Example.App' 'Store' $store $false $null))
+$stray = Get-StrayAppxPackage -Packages $pkgs -ProvisionedNames @()
+"stray: $(($stray | ForEach-Object Name) -join ',')"
+try { Remove-StrayAppxPackage -Stray $stray; 'no error' } catch { "refused: $($_.Exception.Message)" }
+"removed: $($script:removed.Count)"
+''')
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "stray: Example.App\n" in out, out
+    assert "refused: Remove-AppxPackage has no -AllUsers here; remove by hand: Example.App_1.0_neutral__x" in out, out
+    assert "removed: 0" in out, out
+
+
+def test_finalize_removes_stray_packages_for_all_users_on_server_2022(tmp_path):
+    # The Server 2019/2022 path the fix must not change: NonRemovable decides,
+    # and an unprovisioned user-installed package (Edge after an update) is
+    # removed with -AllUsers.
+    result = _finalize(tmp_path, APPX + REMOVE_2022 + r'''
+$pkgs = @(
+    (Pkg 'Microsoft.AAD.BrokerPlugin' 'System' $sys $false $true),
+    (Pkg 'Microsoft.MicrosoftEdge.Stable' 'Developer' 'C:\Program Files (x86)\Microsoft\Edge' $false $false),
+    (Pkg 'Microsoft.UI.Xaml.2.7' 'Store' $store $true $false),
+    (Pkg 'Microsoft.Provisioned' 'Store' $store $false $false))
+$stray = Get-StrayAppxPackage -Packages $pkgs -ProvisionedNames @('Microsoft.Provisioned')
+Remove-StrayAppxPackage -Stray $stray
+$script:removed | ForEach-Object { "removed: $_" }
+''')
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "removing Microsoft.MicrosoftEdge.Stable_1.0_neutral__x" in out, out
+    assert "1 package(s) removed" in out, out
+    assert out.count("removed: ") == 1 and "removed: Microsoft.MicrosoftEdge.Stable_1.0_neutral__x allusers=True" in out, out
+
+
+# sshd as a stand-in service: Get-Service reads it, each read while pending
+# counts down $pendingReads until it is Running; Stop-Service fails while it is
+# pending, as the real one did ("Cannot stop sshd service").
+SSHD = r'''
+$script:log = @()
+$script:svc = @{ Status = '__STATUS__'; StartType = 'Automatic' }
+$script:pendingReads = __READS__
+function Get-Service { param([string]$Name)
+    if ("$($script:svc.Status)" -like '*Pending') {
+        if ($script:pendingReads -le 0) { $script:svc.Status = 'Running' } else { $script:pendingReads-- } }
+    $o = [pscustomobject]@{ Name = $Name; Status = $script:svc.Status; StartType = $script:svc.StartType }
+    $o | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
+        param($want, $timeout) if ($script:svc.Status -ne $want) { throw "sshd is $($script:svc.Status), not $want" } }
+    $o
+}
+function Set-Service { param([string]$Name, $StartupType) $script:svc.StartType = "$StartupType"; $script:log += "set $StartupType" }
+function Stop-Service { param([string]$Name)
+    $script:log += "stop while $($script:svc.Status)"
+    if ("$($script:svc.Status)" -like '*Pending') { throw "Service 'OpenSSH SSH Server (sshd)' cannot be stopped" }
+    $script:svc.Status = 'Stopped' }
+function Start-Sleep { param($Seconds) [Threading.Thread]::Sleep(50) }
+try { Stop-SshdForSysprep __ARGS__; 'returned' } catch { "failed: $($_.Exception.Message)" }
+"final: $($script:svc.Status) $($script:svc.StartType)"
+"log: $($script:log -join '; ')"
+'''
+
+
+def _sshd(tmp_path, status, reads=0, args=""):
+    return _finalize(tmp_path, SSHD.replace("__STATUS__", status).replace("__READS__", str(reads))
+                     .replace("__ARGS__", args))
+
+
+def test_finalize_waits_out_a_starting_sshd_then_stops_it(tmp_path):
+    # Measured on the second ws2016 base build: Stop-Service sshd failed.
+    result = _sshd(tmp_path, "StartPending", reads=3)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "sshd before the stop: StartPending, start type Disabled" in out, out
+    assert "returned" in out and "final: Stopped Disabled" in out, out
+    assert "log: set Disabled; stop while Running" in out, out
+
+
+def test_finalize_stops_a_running_sshd_and_leaves_a_stopped_one(tmp_path):
+    result = _sshd(tmp_path / "running", "Running")
+    out = result.stdout + result.stderr
+    assert result.returncode == 0 and "final: Stopped Disabled" in out, out
+    assert "log: set Disabled; stop while Running" in out, out
+    result = _sshd(tmp_path / "stopped", "Stopped")
+    out = result.stdout + result.stderr
+    assert result.returncode == 0 and "final: Stopped Disabled" in out, out
+    assert "log: set Disabled\n" in out, out
+
+
+def test_finalize_fails_when_sshd_stays_pending(tmp_path):
+    # Still starting after the wait: the stop is tried and its failure stops
+    # the step (fail closed; sysprep does not run).
+    result = _sshd(tmp_path, "StartPending", reads=10 ** 6, args="-PendingTimeoutSeconds 1")
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "failed: Service 'OpenSSH SSH Server (sshd)' cannot be stopped" in out, out
+    assert "final: StartPending Disabled" in out, out

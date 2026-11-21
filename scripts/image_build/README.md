@@ -315,10 +315,13 @@ is passed (which the core does for `KEEP_SSH=yes`).
   `expand_payload.ps1` beside it. It is extracted with `tar.exe` where
   Windows has it (Server 2019 and later); where it does not (Server 2016 and
   older), `expand_payload.ps1` extracts it with .NET: regular files and
-  directories in GNU tar, pax or ustar form, with long names. It refuses
-  links, devices, absolute paths, paths that leave `C:\image-build` or are
-  not valid Windows paths, a header whose checksum does not match and an
-  archive that ends early: such a payload fails the build at the upload.
+  directories in GNU tar, pax or ustar form, with long names. Before it
+  writes anything it decompresses the whole archive once and checks it
+  against the gzip trailer (CRC-32 and length), so a truncated or damaged
+  archive extracts nothing. It refuses links, devices, absolute paths, paths
+  that leave `C:\image-build` or are not valid Windows paths, a tar header
+  whose checksum does not match and a tar stream that ends early: such a
+  payload fails the build at the upload.
   Both files are deleted after the extract, so a payload may not hold either
   name at its root.
 - `seal_windows.ps1` deletes `C:\image-build` and
@@ -737,10 +740,16 @@ the cryptographic RNG, held in a `SecureString` and never output. Every
 clone therefore has its own unrecorded password; the builder logs in with a
 key, and the seal sets yet another.
 
-**Licence.** Evaluation edition. The base was activated (180 days) before
+**Licence.** Evaluation edition. The base is activated (180 days) before
 sysprep, which resets that: a fresh clone starts in a 10-day initial grace
-period (`slmgr /dlv`), and `slmgr /ato` on a clone returned `0x80041008` on
-2026-11-14, so online activation of a clone is not proven. Built images are
+period (`slmgr /dlv`). On the updated `ws2022` base of 2026-11-14,
+`slmgr /ato` on a clone returned `0x80041008`, so online activation of that
+lineage is not proven. On the un-updated `ws2016` base, `slmgr /ato` on a
+fresh clone activates it for 180 days, provided the activation host
+resolves: run straight after first boot it failed with `0x80072EE7` (name
+not resolved), so a recipe that activates should first wait until
+`activation-v2.sls.microsoft.com` resolves and retry `/ato` a few times on
+`0x80072EE7`, `0x80072EFD`, `0x80072EE2` or `0x8007232B`. Built images are
 not sysprepped and keep their build VM's licence state; check `slmgr /dlv`
 on a built image before relying on it for a term.
 

@@ -93,8 +93,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`windows_base/install-openssh.ps1`), only if its SHA-256 matches the pin;
   and where .NET offers no TLS 1.2 by default the base turns it on.
 - `expand_payload.ps1`: on a Windows build VM without `tar.exe` (Server 2016
-  and older) the core extracts the payload with .NET instead, refusing links,
-  paths outside the payload directory and damaged archives.
+  and older) the core extracts the payload with .NET instead. It checks the
+  whole gzip stream against its trailer (CRC-32 and length) before writing
+  anything, and refuses links, paths outside the payload directory and
+  damaged tar headers.
 
 ### Changed
 

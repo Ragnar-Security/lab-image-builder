@@ -6,11 +6,15 @@
 # It reads what GNU tar and bsdtar write for a payload: regular files and
 # directories, GNU long names ('L') and long link names ('K'), pax extended
 # headers ('x'; global 'g' headers are skipped) and the ustar name prefix. Each
-# header's checksum is verified. It fails closed, exit 1, on anything else: a
-# symbolic or hard link, a device, a FIFO, a sparse file, a member whose path
-# is absolute, leaves the destination or is not a valid Windows path, and an
-# archive that ends early. A file that exists is overwritten, so a retried
-# extract finishes the tree. Prints one summary line.
+# header's checksum is verified. Before anything is written, the whole gzip
+# stream is decompressed once and checked against its own trailer (CRC-32 and
+# ISIZE, the uncompressed length modulo 2^32), so a truncated or damaged
+# archive writes nothing. It fails closed, exit 1, on that and on anything
+# else a payload never holds: a symbolic or hard link, a device, a FIFO, a
+# sparse file, a member whose path is absolute, leaves the destination or is
+# not a valid Windows path, and a tar stream that ends early. A file that
+# exists is overwritten, so a retried extract finishes the tree. Prints one
+# summary line.
 param(
     [Parameter(Mandatory = $true)][string]$Archive,
     [Parameter(Mandatory = $true)][string]$Destination
@@ -94,12 +98,73 @@ function Resolve-Member([string]$name, [string]$root) {
     return [System.IO.Path]::Combine($root, ($parts -join '\'))
 }
 
+# CRC-32 (IEEE, as gzip uses it), compiled once: a PowerShell loop per byte
+# would take minutes on a large payload.
+Add-Type -TypeDefinition @'
+public static class ExpandPayloadCrc32 {
+    static readonly uint[] Table = MakeTable();
+    static uint[] MakeTable() {
+        uint[] t = new uint[256];
+        for (uint i = 0; i < 256; i++) {
+            uint c = i;
+            for (int k = 0; k < 8; k++) { c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1; }
+            t[i] = c;
+        }
+        return t;
+    }
+    public static uint Update(uint crc, byte[] buffer, int count) {
+        crc = ~crc;
+        for (int i = 0; i < count; i++) { crc = Table[(crc ^ buffer[i]) & 0xFF] ^ (crc >> 8); }
+        return ~crc;
+    }
+}
+'@
+
+# Decompress the whole archive and compare with the gzip trailer, whatever
+# .NET's own GZipStream checks (it has not always checked the trailer, and a
+# cut stream can end without an error). One gzip member, as tar -z writes.
+function Assert-GzipIntact([string]$path) {
+    $raw = [System.IO.File]::OpenRead($path)
+    try {
+        if ($raw.Length -lt 18) { throw 'it is shorter than a gzip header and trailer' }
+        $head = New-Object byte[] 2
+        Read-Exactly $raw $head 2
+        if ($head[0] -ne 0x1f -or $head[1] -ne 0x8b) { throw 'it does not start with the gzip magic bytes' }
+        $trailer = New-Object byte[] 8
+        [void]$raw.Seek(-8, [System.IO.SeekOrigin]::End)
+        Read-Exactly $raw $trailer 8
+        $wantCrc = [BitConverter]::ToUInt32($trailer, 0)
+        $wantSize = [BitConverter]::ToUInt32($trailer, 4)
+        [void]$raw.Seek(0, [System.IO.SeekOrigin]::Begin)
+        $gz = New-Object System.IO.Compression.GZipStream($raw, [System.IO.Compression.CompressionMode]::Decompress, $true)
+        try {
+            $buffer = New-Object byte[] 1048576
+            [uint32]$crc = 0
+            [long]$size = 0
+            while (($n = $gz.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $crc = [ExpandPayloadCrc32]::Update($crc, $buffer, $n)
+                $size += $n
+            }
+        } finally { $gz.Dispose() }
+    } catch {
+        throw "$path is not an intact gzip archive: $($_.Exception.Message)"
+    } finally {
+        $raw.Dispose()
+    }
+    if ($crc -ne $wantCrc -or ($size % 4294967296) -ne $wantSize) {
+        throw ("$path is not an intact gzip archive: CRC-32 {0:x8} and length {1} do not match its trailer ({2:x8}, {3}); truncated or damaged" -f $crc, $size, $wantCrc, $wantSize)
+    }
+}
+
+$archivePath = (Resolve-Path -LiteralPath $Archive).ProviderPath
+Assert-GzipIntact $archivePath
+
 $root = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')
 [void][System.IO.Directory]::CreateDirectory($root)
 $epoch = New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
 $files = 0; $dirs = 0; [long]$bytes = 0
 
-$file = [System.IO.File]::OpenRead((Resolve-Path -LiteralPath $Archive).ProviderPath)
+$file = [System.IO.File]::OpenRead($archivePath)
 try {
     $gzip = New-Object System.IO.Compression.GZipStream($file, [System.IO.Compression.CompressionMode]::Decompress)
     $header = New-Object byte[] 512

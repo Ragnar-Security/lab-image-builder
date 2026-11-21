@@ -76,6 +76,17 @@ def test_default_image_is_the_rocky_9_generic_cloud_image(tmp_path):
             in result.stderr), result.stderr
 
 
+def test_template_cpu_type_runs_rhel9(tmp_path):
+    # RHEL 9 is built for x86-64-v2; on qm's default CPU (kvm64) its glibc
+    # stops init ("Fatal glibc error: CPU does not support x86-64-v2", a
+    # kernel panic), so the guest agent never answers. Clones inherit the type.
+    result = _run(tmp_path, "--apply")
+    assert result.returncode == 0, result.stderr
+    create = [c for c in _cmds(tmp_path) if c.startswith("qm create ")]
+    assert len(create) == 1 and " --cpu x86-64-v2-AES " in create[0] + " ", create
+    assert _state(tmp_path)["8000"]["config"]["cpu"] == "x86-64-v2-AES"
+
+
 def test_failure_midway_destroys_only_this_runs_vm(tmp_path):
     result = _run(tmp_path, "--apply", FAKE_QM_FAIL_ON="resize")
     assert result.returncode != 0

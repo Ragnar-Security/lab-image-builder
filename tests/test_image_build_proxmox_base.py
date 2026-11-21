@@ -402,6 +402,14 @@ def test_unknown_release_is_refused_before_the_node_is_reached(tmp_path, bad):
     assert not (tmp_path / "calls.log").exists()
 
 
+def test_ubuntu_template_keeps_qm_default_cpu(tmp_path):
+    # Only the Rocky base sets a CPU type; the Ubuntu bases stay as built.
+    result = _run(tmp_path, "--apply")
+    assert result.returncode == 0, result.stderr
+    create = [c for c in _cmds(tmp_path) if c.startswith("qm create ")]
+    assert len(create) == 1 and "--cpu" not in create[0], create
+
+
 # --- finding 1: a half-made VM is destroyed, and only when it carries the marker ---
 
 
